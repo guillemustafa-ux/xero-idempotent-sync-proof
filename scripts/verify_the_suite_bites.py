@@ -147,13 +147,15 @@ def main() -> int:
         if mutation.old not in original:
             print(f"\n!! {mutation.name}: anchor not found in {mutation.path.name}")
             return 1
+        # ``newline="\n"``: on Windows the default would restore the file
+        # with CRLF endings, and the repo pins LF.
         try:
             mutation.path.write_text(
-                original.replace(mutation.old, mutation.new, 1), encoding="utf-8"
+                original.replace(mutation.old, mutation.new, 1), encoding="utf-8", newline="\n"
             )
             code, failed = run_suite()
         finally:
-            mutation.path.write_text(original, encoding="utf-8")
+            mutation.path.write_text(original, encoding="utf-8", newline="\n")
 
         print(f"\n[{mutation.name}]")
         print(f"  defect: {mutation.defect}")
