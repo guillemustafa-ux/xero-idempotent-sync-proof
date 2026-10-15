@@ -54,6 +54,7 @@ import hashlib
 import json
 import re
 import secrets
+import socket
 import threading
 import time
 import uuid
@@ -295,7 +296,10 @@ class _Handler(BaseHTTPRequestHandler):
         """
         self.close_connection = True
         try:
-            self.wfile.close()
+            # Shut the socket down rather than closing ``wfile``: the handler
+            # still flushes the writer afterwards, and a closed writer would
+            # raise a noisy ValueError in the server thread.
+            self.connection.shutdown(socket.SHUT_RDWR)
             self.connection.close()
         except OSError:
             pass
