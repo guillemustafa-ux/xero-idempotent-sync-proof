@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Callable
 
 import pytest
 
+from xero_idempotent_sync_proof._crash_child import CRASH_EXIT_CODE
 from xero_idempotent_sync_proof.auth import Authenticator, TokenStore
 from xero_idempotent_sync_proof.client import XeroClient
 from xero_idempotent_sync_proof.fake_xero import CLIENT_ID, CLIENT_SECRET, FakeXero
 from xero_idempotent_sync_proof.ledger import Ledger
+from xero_idempotent_sync_proof.sync import SyncEngine
 
 
 @pytest.fixture
@@ -111,6 +115,78 @@ def client_factory(auth_factory):
         )
 
     return make
+
+
+@pytest.fixture
+def engine_factory(ledger_factory, client_factory):
+    """A brand-new engine: fresh ledger connection, fresh client, no memory.
+
+    ``on_seam`` is the same hook the crash child uses; a test can run another
+    worker inside it to force an interleaving that a real race only produces
+    sometimes.
+    """
+
+    def make(
+        xero: FakeXero,
+        path: str | None = None,
+        *,
+        on_seam: Callable[[str], None] | None = None,
+    ) -> SyncEngine:
+        return SyncEngine(
+            ledger=ledger_factory(path), client=client_factory(xero, path), on_seam=on_seam
+        )
+
+    return make
+
+
+@pytest.fixture
+def run_child(db_path, auth_factory):
+    """Run one sync in a separate process and kill it mid-flight.
+
+    Returns the completed process so a test can assert the death was the
+    scripted one (exit code 137) and not a stray exception.
+    """
+
+    def run(
+        xero: FakeXero,
+        deal_id: str,
+        crash_at: str,
+        strategy: str = "durable",
+        payment_id: str = "",
+    ):
+        auth_factory(xero)  # the child authenticates from the shared token store
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "xero_idempotent_sync_proof._crash_child",
+                "--db",
+                db_path,
+                "--base-url",
+                xero.base_url,
+                "--tenant-id",
+                xero.tenant_id,
+                "--deal-id",
+                deal_id,
+                "--crash-at",
+                crash_at,
+                "--strategy",
+                strategy,
+                "--payment-id",
+                payment_id,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=str(Path(__file__).resolve().parent.parent),
+        )
+        assert proc.returncode == CRASH_EXIT_CODE, (
+            f"child was supposed to be killed at '{crash_at}', but exited "
+            f"{proc.returncode}\nstdout: {proc.stdout}\nstderr: {proc.stderr}"
+        )
+        return proc
+
+    return run
 
 
 @pytest.fixture

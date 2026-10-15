@@ -342,7 +342,7 @@ class Ledger:
     # -- bindings ---------------------------------------------------------
 
     def bind_contact(
-        self, deal_id: str, contact_id: str, name: str, contact_number: str
+        self, deal_id: str, contact_id: str, name: str, contact_number: str | None
     ) -> None:
         self._conn.execute(
             "UPDATE deals SET xero_contact_id = ?, xero_contact_name = ?, "
@@ -350,7 +350,8 @@ class Ledger:
             (contact_id, name, contact_number, deal_id),
         )
 
-    def bind_project(self, deal_id: str, project_id: str, mode: str) -> None:
+    def bind_project(self, deal_id: str, project_id: str | None, mode: str) -> None:
+        """``project_id`` is ``None`` exactly when ``mode`` says the API was unavailable."""
         self._conn.execute(
             "UPDATE deals SET xero_project_id = ?, project_mode = ? WHERE deal_id = ?",
             (project_id, mode, deal_id),
