@@ -1,0 +1,2 @@
+# Every text file is committed and checked out with LF, on every platform.
+* text=auto eol=lf
