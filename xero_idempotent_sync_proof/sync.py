@@ -292,6 +292,31 @@ class SyncEngine:
         self.ledger.bind_project(deal.deal_id, project_id, mode)
 
     def _settle_project(self, deal: Deal, intent: Intent, name: str) -> dict[str, Any]:
+        """Look first, always; then create what is proven absent.
+
+        A project name is not unique, so a resend is a second project, and
+        the key covers only the first six minutes. The question has to be
+        asked separately: which projects carry the name we planted, under
+        this contact? Exactly one is ours. Zero means it never landed. More
+        than one means somebody already duplicated, and picking one is a
+        guess. A 403 from either call propagates: the plan has no Projects.
+        """
+        found = self.client.find_projects(deal.xero_contact_id, name)
+        if len(found) > 1:
+            raise UnresolvableStep(
+                deal.deal_id,
+                STEP_PROJECT,
+                f"{len(found)} projects named {name!r} exist under contact "
+                f"{deal.xero_contact_id}: {[p['projectId'] for p in found]}; refusing to pick one",
+            )
+        if found:
+            log.info(
+                "resolve %s step=project by planted name -> ADOPT (projectId=%s)",
+                deal.deal_id,
+                found[0]["projectId"],
+            )
+            return found[0]
+        log.info("resolve %s step=project by planted name -> PROVEN ABSENT", deal.deal_id)
         created = self.client.create_project(
             deal.xero_contact_id, name, idempotency_key=intent.idempotency_key
         )
