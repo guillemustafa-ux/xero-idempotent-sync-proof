@@ -5,7 +5,35 @@ from typing import Any
 
 import pytest
 
+from xero_idempotent_sync_proof.fake_xero import FakeXero
 from xero_idempotent_sync_proof.ledger import Ledger
+
+
+@pytest.fixture
+def xero_factory():
+    """A Xero stand-in, with or without the Projects API available to the org."""
+    running: list[FakeXero] = []
+
+    def make(*, projects_available: bool = False) -> FakeXero:
+        xero = FakeXero(projects_available=projects_available)
+        xero.start()
+        running.append(xero)
+        return xero
+
+    yield make
+    for xero in running:
+        xero.stop()
+
+
+@pytest.fixture
+def xero(xero_factory) -> FakeXero:
+    """The default: an organisation whose plan does not include Projects."""
+    return xero_factory()
+
+
+@pytest.fixture
+def xero_with_projects(xero_factory) -> FakeXero:
+    return xero_factory(projects_available=True)
 
 
 @pytest.fixture
