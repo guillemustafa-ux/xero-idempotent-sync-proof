@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,11 +18,19 @@ from xero_idempotent_sync_proof.sync import SyncEngine
 
 @pytest.fixture
 def xero_factory():
-    """A Xero stand-in, with or without the Projects API available to the org."""
+    """A Xero stand-in, with or without the Projects API available to the org.
+
+    Its clock is **frozen** at the moment the fake starts and moves only on
+    ``advance()``, so "one second before the window closes" is exactly that
+    and no wall-clock time can creep in between two calls. It starts at the
+    real time so the crash child, which reads the real clock, agrees with it
+    about token expiry.
+    """
     running: list[FakeXero] = []
 
     def make(*, projects_available: bool = False) -> FakeXero:
-        xero = FakeXero(projects_available=projects_available)
+        frozen_at = time.time()
+        xero = FakeXero(projects_available=projects_available, clock=lambda: frozen_at)
         xero.start()
         running.append(xero)
         return xero
@@ -143,8 +152,10 @@ def engine_factory(ledger_factory, client_factory):
 def run_child(db_path, auth_factory):
     """Run one sync in a separate process and kill it mid-flight.
 
-    Returns the completed process so a test can assert the death was the
-    scripted one (exit code 137) and not a stray exception.
+    Asserts the death was the scripted one (exit code 137): a seam that fired,
+    or, for the naive strategies, the transport error the server arranged. An
+    unexpected exception exits with a different code and fails the test with
+    its traceback.
     """
 
     def run(
@@ -181,8 +192,9 @@ def run_child(db_path, auth_factory):
             cwd=str(Path(__file__).resolve().parent.parent),
         )
         assert proc.returncode == CRASH_EXIT_CODE, (
-            f"child was supposed to be killed at '{crash_at}', but exited "
-            f"{proc.returncode}\nstdout: {proc.stdout}\nstderr: {proc.stderr}"
+            f"child was supposed to die the scripted death at '{crash_at}' "
+            f"(strategy {strategy}), but exited {proc.returncode}\n"
+            f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
         )
         return proc
 
