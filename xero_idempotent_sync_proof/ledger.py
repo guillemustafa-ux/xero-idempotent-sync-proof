@@ -178,15 +178,26 @@ class Ledger:
                 xero_contact_name    TEXT,
                 xero_contact_number  TEXT,
                 xero_project_id      TEXT,
-                project_mode         TEXT CHECK (project_mode IS NULL OR project_mode IN
-                                     ('{PROJECT_MODE_PROJECTS_API}', '{PROJECT_MODE_UNAVAILABLE}')),
+                project_mode         TEXT,
                 xero_invoice_id      TEXT,
                 xero_invoice_number  TEXT,
                 amount_paid          REAL NOT NULL DEFAULT 0,
                 amount_owed          REAL NOT NULL DEFAULT 0,
                 last_payment_at      TEXT,
                 sync_status          TEXT NOT NULL,
-                last_error           TEXT
+                last_error           TEXT,
+                -- A project id exists exactly when the mode says a real
+                -- Project was made. Enforced here, not only in the code. A
+                -- CASE, not a chain of ORs: a NULL mode compared with '='
+                -- yields NULL, and SQLite lets a NULL CHECK pass.
+                CHECK (
+                    CASE
+                        WHEN project_mode IS NULL THEN xero_project_id IS NULL
+                        WHEN project_mode = '{PROJECT_MODE_PROJECTS_API}' THEN xero_project_id IS NOT NULL
+                        WHEN project_mode = '{PROJECT_MODE_UNAVAILABLE}' THEN xero_project_id IS NULL
+                        ELSE 0
+                    END
+                )
             )
             """
         )
@@ -351,7 +362,10 @@ class Ledger:
         )
 
     def bind_project(self, deal_id: str, project_id: str | None, mode: str) -> None:
-        """``project_id`` is ``None`` exactly when ``mode`` says the API was unavailable."""
+        """``project_id`` is ``None`` exactly when ``mode`` says the API was unavailable.
+
+        The ``deals`` table's CHECK constraint refuses any other combination.
+        """
         self._conn.execute(
             "UPDATE deals SET xero_project_id = ?, project_mode = ? WHERE deal_id = ?",
             (project_id, mode, deal_id),

@@ -128,15 +128,30 @@ def test_the_schema_refuses_a_second_binding(ledger_factory, make_webhook):
         ledger.bind_payment("deal-2", "pay-2", "pm-1")
 
 
-def test_project_mode_is_never_blank_once_a_project_is_bound(ledger_factory, make_webhook):
+def test_project_mode_and_project_id_agree_or_the_schema_refuses(ledger_factory, make_webhook):
+    """A project id exists exactly when the mode says a real Project was made.
+
+    ``unavailable`` with an id, ``projects_api`` without one, or a mode outside
+    the two: the database refuses each, so the business can never read
+    "project" where there is none, or "none" where there is one.
+    """
     ledger = ledger_factory()
     ledger.record_webhook(make_webhook())
-    ledger.bind_project("deal-1001", "p-1", PROJECT_MODE_UNAVAILABLE)
-    deal = ledger.get_deal("deal-1001")
-    assert deal.xero_project_id == "p-1"
-    assert deal.project_mode in (PROJECT_MODE_PROJECTS_API, PROJECT_MODE_UNAVAILABLE)
+
+    ledger.bind_project("deal-1001", None, PROJECT_MODE_UNAVAILABLE)
+    assert ledger.get_deal("deal-1001").project_mode == PROJECT_MODE_UNAVAILABLE
+    ledger.bind_project("deal-1001", "p-1", PROJECT_MODE_PROJECTS_API)
+    assert ledger.get_deal("deal-1001").xero_project_id == "p-1"
+
+    with pytest.raises(sqlite3.IntegrityError):
+        ledger.bind_project("deal-1001", "p-2", PROJECT_MODE_UNAVAILABLE)
+    with pytest.raises(sqlite3.IntegrityError):
+        ledger.bind_project("deal-1001", None, PROJECT_MODE_PROJECTS_API)
     with pytest.raises(sqlite3.IntegrityError):
         ledger.bind_project("deal-1001", "p-2", "")
+    with pytest.raises(sqlite3.IntegrityError):
+        ledger.bind_project("deal-1001", "p-2", None)
+    assert ledger.get_deal("deal-1001").xero_project_id == "p-1", "every refusal left the row as it was"
 
 
 def test_balance_is_stated_not_added(ledger_factory, make_webhook):
