@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
-from xero_idempotent_sync_proof.fake_xero import FakeXero
+from xero_idempotent_sync_proof.auth import Authenticator, TokenStore
+from xero_idempotent_sync_proof.client import XeroClient
+from xero_idempotent_sync_proof.fake_xero import CLIENT_ID, CLIENT_SECRET, FakeXero
 from xero_idempotent_sync_proof.ledger import Ledger
 
 
@@ -59,6 +61,56 @@ def ledger_factory(db_path):
     yield make
     for ledger in opened:
         ledger.close()
+
+
+@pytest.fixture
+def auth_factory(db_path):
+    """An authenticator over a token store in the same database file.
+
+    The first one for a database seeds it with the refresh token the
+    authorisation flow would have produced -- exactly once, so later
+    "processes" against the same file find whatever the previous one left.
+    The authenticator reads the fake's clock, so advancing the fake advances
+    the client's idea of expiry as well.
+    """
+    opened: list[TokenStore] = []
+
+    def make(xero: FakeXero, path: str | None = None) -> Authenticator:
+        store = TokenStore(path or db_path)
+        opened.append(store)
+        if store.load() is None:
+            store.bootstrap(xero.refresh_token)
+        return Authenticator(
+            store,
+            token_url=xero.token_url,
+            client_id=CLIENT_ID,
+            client_secret=CLIENT_SECRET,
+            now=xero.now,
+        )
+
+    yield make
+    for store in opened:
+        store.close()
+
+
+@pytest.fixture
+def client_factory(auth_factory):
+    def make(
+        xero: FakeXero,
+        path: str | None = None,
+        *,
+        sleep: Callable[[float], None] = lambda _seconds: None,
+    ) -> XeroClient:
+        # No sleeping in the proof unless a test wants to record the sleeps.
+        return XeroClient(
+            xero.base_url,
+            xero.tenant_id,
+            auth_factory(xero, path),
+            timeout=5.0,
+            sleep=sleep,
+        )
+
+    return make
 
 
 @pytest.fixture
