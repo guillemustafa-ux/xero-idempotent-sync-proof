@@ -1,0 +1,296 @@
+"""Scenario 4 -- payments are where duplicates cost money, and the ledger is what the business reads.
+
+Webhooks arrive twice, arrive late, and arrive out of order. Every payment
+must land on the same contact and invoice exactly once, and the operational
+record must state the balance rather than count it.
+
+Xero gives a payment no unique field. The ``Reference`` we plant is the only
+handle, and Xero does not enforce it, so the sync has to *count* the
+payments on the invoice carrying it -- and stop when the count is wrong.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+
+import pytest
+
+from xero_idempotent_sync_proof.client import UnknownOutcome
+from xero_idempotent_sync_proof.fake_xero import IDEMPOTENCY_TTL_SECONDS, ROUTE_PAYMENT
+from xero_idempotent_sync_proof.ledger import (
+    PENDING,
+    STEP_PAYMENT,
+    SYNC_ERROR,
+    SYNC_SYNCED,
+    idempotency_key_for,
+    invoice_number_for,
+    payment_reference_for,
+)
+from xero_idempotent_sync_proof.sync import UnresolvableStep, naive_payment_sync
+
+
+def payment_puts(xero) -> list[str]:
+    """Every create that reached the payment route (replays excluded)."""
+    return [r for r in xero.request_log if r.startswith("PUT /api.xro/2.0/Payments key=")]
+
+
+def test_duplicate_webhook_delivery_records_one_payment(xero, engine_factory, make_webhook):
+    """The CRM delivers the same webhook twice. Xero must see one payment."""
+    webhook = make_webhook(amount=2500.0)
+    engine = engine_factory(xero)
+
+    first = engine.apply(webhook)
+    second = engine_factory(xero).apply(webhook)  # a different worker, same delivery
+
+    assert len(xero.payments) == 1
+    assert first.amount_paid == second.amount_paid == 2500.0
+    assert second.amount_owed == 10000.0
+    assert xero.invoices[second.xero_invoice_id]["AmountDue"] == 10000.0
+
+
+def test_two_workers_past_the_lookup_at_the_same_moment_book_one_payment(
+    xero, engine_factory, make_webhook, tmp_path
+):
+    """What the six-minute key is actually for.
+
+    Two replicas with their own databases -- a blue/green deploy, a rebuilt
+    ledger next to the old one -- receive the same delivery. Both look the
+    payment up, both see none, both send. The lookup cannot help here; only
+    a key both of them *derive* identically makes the second send a replay.
+    """
+    webhook = make_webhook(amount=2500.0)
+    replica = engine_factory(xero, path=str(tmp_path / "replica.db"))
+
+    def the_other_replica_wins_the_race(seam: str) -> None:
+        if seam == "before_payment_send":
+            replica.apply(webhook)
+
+    primary = engine_factory(xero, on_seam=the_other_replica_wins_the_race)
+    deal = primary.apply(webhook)
+
+    assert len(xero.payments) == 1, "two sends, one payment"
+    assert deal.amount_paid == 2500.0 and deal.amount_owed == 10000.0
+    ours = {p.xero_payment_id for p in primary.ledger.payments_for(deal.deal_id)}
+    theirs = {p.xero_payment_id for p in replica.ledger.payments_for(deal.deal_id)}
+    assert ours == theirs == set(xero.payments), "both ledgers bound the same PaymentID"
+    key = idempotency_key_for("deal-1001", STEP_PAYMENT, "pay-1")
+    assert payment_puts(xero) == [f"PUT /api.xro/2.0/Payments key={key}"]
+    assert f"REPLAY PUT /api.xro/2.0/Payments key={key}" in xero.request_log
+
+
+def test_a_second_payment_hits_the_same_contact_and_invoice(xero, engine_factory, make_webhook):
+    """Later payments on the same deal reuse everything and add one Payment."""
+    engine = engine_factory(xero)
+    first = engine.apply(
+        make_webhook(payment_id="pay-1", amount=2500.0, paid_at="2026-09-01T10:00:00Z")
+    )
+    second = engine.apply(
+        make_webhook(payment_id="pay-2", amount=4000.0, paid_at="2026-10-01T10:00:00Z")
+    )
+
+    assert (second.xero_contact_id, second.project_mode, second.xero_invoice_id) == (
+        first.xero_contact_id,
+        first.project_mode,
+        first.xero_invoice_id,
+    )
+    assert len(xero.contacts) == 1 and len(xero.invoices) == 1, "nothing else was created"
+    assert len(xero.payments) == 2
+    assert second.amount_paid == 6500.0
+    assert second.amount_owed == 6000.0, "read back from the invoice, not added up locally"
+    assert second.last_payment_at == "2026-10-01T10:00:00Z"
+    assert second.sync_status == SYNC_SYNCED
+    references = sorted(p["Reference"] for p in xero.payments.values())
+    assert references == [
+        payment_reference_for("deal-1001", "pay-1"),
+        payment_reference_for("deal-1001", "pay-2"),
+    ], "each payment carries the reference it can be found by"
+
+
+def test_out_of_order_delivery_ends_in_the_same_state(xero, engine_factory, make_webhook):
+    """The second payment's webhook arrives first, then the first, then both again."""
+    pay1 = make_webhook(payment_id="pay-1", amount=2500.0, paid_at="2026-09-01T10:00:00Z")
+    pay2 = make_webhook(payment_id="pay-2", amount=4000.0, paid_at="2026-10-01T10:00:00Z")
+
+    engine = engine_factory(xero)
+    for webhook in (pay2, pay1, pay2, pay1):
+        deal = engine.apply(webhook)
+
+    assert len(xero.payments) == 2
+    assert deal.amount_paid == 6500.0 and deal.amount_owed == 6000.0
+    assert deal.last_payment_at == "2026-10-01T10:00:00Z"
+    ids = {p.xero_payment_id for p in engine.ledger.payments_for(deal.deal_id)}
+    assert ids == set(xero.payments), "each CRM payment maps to exactly one Xero payment"
+
+
+def test_naive_payment_retry_after_a_real_kill_pays_the_invoice_twice(
+    xero, engine_factory, ledger_factory, client_factory, run_child, make_webhook
+):
+    """The anti-pattern where it costs money.
+
+    Contact and invoice exist. The payment create commits, the response is
+    lost, the worker dies. The retry trusts the derived key -- which would
+    have worked for six minutes -- and has no record of the attempt and
+    nothing to look up. Seven minutes later there is no name to collide on,
+    so the invoice is simply paid twice.
+    """
+    webhook = make_webhook(amount=2500.0)
+    engine = engine_factory(xero)
+    deal_id = engine.ledger.record_webhook(webhook)
+    engine._ensure_contact(engine.ledger.get_deal(deal_id))
+    engine._ensure_project(engine.ledger.get_deal(deal_id))
+    engine._ensure_invoice(engine.ledger.get_deal(deal_id))
+
+    xero.drop_response_after_commit(ROUTE_PAYMENT)
+    run_child(xero, deal_id, crash_at="-", strategy="naive-payment", payment_id="pay-1")
+    assert len(xero.payments) == 1
+
+    xero.advance(IDEMPOTENCY_TTL_SECONDS + 1)  # the redelivery, after the window
+    naive_payment_sync(ledger_factory(), client_factory(xero), deal_id, "pay-1")
+
+    invoice = xero.invoices[engine.ledger.get_deal(deal_id).xero_invoice_id]
+    assert len(xero.payments) == 2, "one CRM payment, two Xero payments"
+    assert invoice["AmountPaid"] == 5000.0, "the books now say the couple paid twice"
+    assert invoice["AmountDue"] == 12500.0 - 5000.0
+    assert len(payment_puts(xero)) == 2, "same key both times; the second was processed as new"
+
+
+def test_a_payment_survives_a_real_kill_between_200_and_persist(
+    xero, ledger_factory, engine_factory, run_child, make_webhook
+):
+    """The same kill, against the design under test. One payment, one id.
+
+    Recovery reads the invoice's ``Payments[]``, finds exactly one with the
+    reference it planted, and adopts it. No second send, no replay needed.
+    """
+    deal_id = ledger_factory().record_webhook(make_webhook(amount=2500.0))
+
+    run_child(xero, deal_id, crash_at="after_payment_response")
+
+    killed = ledger_factory()
+    intent = killed.get_intent(deal_id, STEP_PAYMENT, "pay-1")
+    assert intent is not None and intent.state == PENDING
+    assert killed.payments_for(deal_id)[0].xero_payment_id is None
+    assert len(xero.payments) == 1
+
+    deal = engine_factory(xero).recover_all()[0]
+
+    assert len(xero.payments) == 1, "recovery must not book the payment twice"
+    assert deal.amount_paid == 2500.0 and deal.amount_owed == 10000.0
+    assert deal.sync_status == SYNC_SYNCED
+    assert killed.payments_for(deal_id)[0].xero_payment_id == next(iter(xero.payments))
+    assert len(payment_puts(xero)) == 1, "settled by the planted Reference, not by resending"
+
+
+def test_two_payments_with_our_reference_escalate_instead_of_guessing(
+    xero, ledger_factory, engine_factory, client_factory, run_child, make_webhook
+):
+    """The honest failure, Xero edition.
+
+    ``Reference`` is not unique. A second payment carrying ours exists on the
+    invoice -- keyed in by hand, or by an earlier bug. Picking either one is
+    a guess with money attached. The sync stops, records both ids, and books
+    nothing more.
+    """
+    deal_id = ledger_factory().record_webhook(make_webhook(amount=2500.0))
+    run_child(xero, deal_id, crash_at="after_payment_response")
+
+    deal = ledger_factory().get_deal(deal_id)
+    planted = client_factory(xero).create_payment(
+        {
+            "Invoice": {"InvoiceID": deal.xero_invoice_id},
+            "Account": {"Code": "090"},
+            "Date": "2026-09-01",
+            "Amount": 2500.0,
+            "Reference": payment_reference_for(deal_id, "pay-1"),
+        },
+        idempotency_key="planted-by-hand",
+    ).entity
+    assert len(xero.payments) == 2
+
+    with pytest.raises(UnresolvableStep) as exc:
+        engine_factory(xero).recover_all()
+
+    assert exc.value.step == STEP_PAYMENT
+    assert "2 payments" in exc.value.detail
+    for payment_id in xero.payments:
+        assert payment_id in exc.value.detail, "both ids, for a human"
+    assert planted["PaymentID"] in exc.value.detail
+    after = ledger_factory()
+    assert after.get_deal(deal_id).sync_status == SYNC_ERROR
+    assert after.payments_for(deal_id)[0].xero_payment_id is None, "nothing was adopted"
+    assert len(xero.payments) == 2, "still two -- we refused to make it three"
+    assert len(payment_puts(xero)) == 2, "one from the killed child, one planted; none from recovery"
+
+
+def test_the_schema_refuses_a_second_binding(ledger_factory, make_webhook):
+    """A last line of defence that does not depend on the code being right.
+
+    One Xero contact, project, invoice or payment binds to at most one local
+    thing. If a future change ever tries to bind a second, the database
+    rejects it rather than letting the duplicate become someone's
+    bookkeeping problem.
+    """
+    ledger = ledger_factory()
+    a = ledger.record_webhook(make_webhook(deal_id="deal-a", payment_id="pay-a"))
+    b = ledger.record_webhook(make_webhook(deal_id="deal-b", payment_id="pay-b"))
+
+    ledger.bind_contact(a, "c-41", "Ana Perez & Tomas Ruiz", "hs-deal-a")
+    with pytest.raises(sqlite3.IntegrityError):
+        ledger.bind_contact(b, "c-41", "Ana Perez & Tomas Ruiz", "hs-deal-b")
+
+    ledger.bind_project(a, "p-55", "projects_api")
+    with pytest.raises(sqlite3.IntegrityError):
+        ledger.bind_project(b, "p-55", "projects_api")
+
+    ledger.bind_invoice(a, "i-77", "HS-deal-a")
+    with pytest.raises(sqlite3.IntegrityError):
+        ledger.bind_invoice(b, "i-77", "HS-deal-b")
+
+    ledger.bind_payment(a, "pay-a", "pm-90")
+    with pytest.raises(sqlite3.IntegrityError):
+        ledger.bind_payment(b, "pay-b", "pm-90")
+
+
+def test_apply_is_safe_to_call_repeatedly(xero, engine_factory, make_webhook):
+    """Idempotence is a property of the operation, not of a retry budget."""
+    webhook = make_webhook(amount=2500.0)
+    engine = engine_factory(xero)
+
+    first = engine.apply(webhook)
+    for _ in range(5):
+        again = engine.apply(webhook)
+        assert again.xero_invoice_id == first.xero_invoice_id
+        assert again.amount_paid == 2500.0
+        assert again.amount_owed == 10000.0
+
+    assert (len(xero.contacts), len(xero.invoices), len(xero.payments)) == (1, 1, 1)
+
+
+def test_a_rebuilt_ledger_after_the_window_adopts_the_invoice_by_number_and_the_payment_by_reference(
+    xero, engine_factory, make_webhook, tmp_path
+):
+    """The strong claim, and the one QuickBooks could not make.
+
+    The ledger is gone *and* the six-minute window is over, so no key
+    replays anything. Every step still settles: the contact by its
+    ``ContactNumber``, the invoice by "Invoice # must be unique." and a
+    lookup by ``InvoiceNumber``, the payment by counting the invoice's
+    ``Payments[]`` for the planted ``Reference``. Nothing is created.
+    """
+    webhook = make_webhook(amount=2500.0)
+    first = engine_factory(xero).apply(webhook)
+    assert (len(xero.contacts), len(xero.invoices), len(xero.payments)) == (1, 1, 1)
+
+    xero.advance(IDEMPOTENCY_TTL_SECONDS + 1)
+    assert xero.idempotency_keys == {}, "no key left to replay"
+    rebuilt = engine_factory(xero, path=str(tmp_path / "rebuilt.db")).apply(webhook)
+
+    assert (len(xero.contacts), len(xero.invoices), len(xero.payments)) == (1, 1, 1)
+    assert rebuilt.xero_contact_id == first.xero_contact_id
+    assert rebuilt.xero_invoice_id == first.xero_invoice_id
+    assert rebuilt.xero_invoice_number == invoice_number_for("deal-1001")
+    assert rebuilt.amount_paid == 2500.0 and rebuilt.amount_owed == 10000.0
+    assert rebuilt.sync_status == SYNC_SYNCED
+    unique = [r for r in xero.request_log if r.startswith("PUT /api.xro/2.0/Invoices key=")]
+    assert len(unique) == 2, "the invoice create was sent again and refused -- that refusal is the lookup trigger"
+    assert len(payment_puts(xero)) == 1, "the payment was never resent: it was counted first"

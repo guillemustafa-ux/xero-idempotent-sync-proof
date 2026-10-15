@@ -302,13 +302,44 @@ class SyncEngine:
 
     def _ensure_invoice(self, deal: Deal) -> None:
         number = invoice_number_for(deal.deal_id)
-        intent = self.ledger.get_intent(deal.deal_id, STEP_INVOICE) or self._begin(
-            deal.deal_id, STEP_INVOICE
-        )
-        invoice = self._create_invoice(deal, intent, number)
+        intent = self.ledger.get_intent(deal.deal_id, STEP_INVOICE)
+        invoice: dict[str, Any] | None = None
+        if intent is not None:
+            # In flight once already: ask by the number we planted first.
+            invoice = self._ours_by_invoice_number(deal, number)
+        else:
+            intent = self._begin(deal.deal_id, STEP_INVOICE)
+        if invoice is None:
+            invoice = self._create_invoice(deal, intent, number)
         self._seam("after_invoice_response")
         self.ledger.finish_step(deal.deal_id, STEP_INVOICE, "", invoice["InvoiceID"])
         self.ledger.bind_invoice(deal.deal_id, invoice["InvoiceID"], invoice["InvoiceNumber"])
+
+    def _ours_by_invoice_number(self, deal: Deal, number: str) -> dict[str, Any] | None:
+        """``GET /Invoices/{InvoiceNumber}``: unique in Xero, derived from the deal, so ours.
+
+        An invoice with our number on another contact is not ours to pay
+        against; that is a human's problem, named with the ids.
+        """
+        invoice = self.client.get_invoice(number)
+        if invoice is None:
+            log.info("resolve %s step=invoice by InvoiceNumber %s -> PROVEN ABSENT", deal.deal_id, number)
+            return None
+        holder = (invoice.get("Contact") or {}).get("ContactID")
+        if holder != deal.xero_contact_id:
+            raise UnresolvableStep(
+                deal.deal_id,
+                STEP_INVOICE,
+                f"invoice {number!r} (InvoiceID={invoice['InvoiceID']}) belongs to contact "
+                f"{holder}, not to this deal's contact {deal.xero_contact_id}",
+            )
+        log.info(
+            "resolve %s step=invoice by InvoiceNumber %s -> ADOPT (InvoiceID=%s)",
+            deal.deal_id,
+            number,
+            invoice["InvoiceID"],
+        )
+        return invoice
 
     def _create_invoice(self, deal: Deal, intent: Intent, number: str) -> dict[str, Any]:
         # Every field is a function of the deal row alone, so the body under
@@ -332,7 +363,21 @@ class SyncEngine:
                 }
             ],
         }
-        created = self.client.create_invoice(body, idempotency_key=intent.idempotency_key)
+        try:
+            created = self.client.create_invoice(body, idempotency_key=intent.idempotency_key)
+        except XeroRejected as exc:
+            if not exc.says(INVOICE_NUMBER_TAKEN):
+                raise
+            # The number is ours, and unique: the refusal says it landed.
+            invoice = self._ours_by_invoice_number(deal, number)
+            if invoice is None:
+                raise UnresolvableStep(
+                    deal.deal_id,
+                    STEP_INVOICE,
+                    f"Xero refused InvoiceNumber {number!r} as taken, yet no invoice by that "
+                    "number can be read back",
+                ) from exc
+            return invoice
         self._log_verdict(intent, created, "InvoiceID")
         return created.entity
 
@@ -344,20 +389,52 @@ class SyncEngine:
         intent = self.ledger.get_intent(deal.deal_id, STEP_PAYMENT, ref) or self._begin(
             deal.deal_id, STEP_PAYMENT, ref
         )
-        body = {
-            "Invoice": {"InvoiceID": deal.xero_invoice_id},
-            "Account": {"Code": BANK_ACCOUNT_CODE},
-            "Date": payment.paid_at[:10],
-            "Amount": payment.amount,
-            "Reference": reference,
-        }
-        self._seam("before_payment_send")
-        created = self.client.create_payment(body, idempotency_key=intent.idempotency_key)
-        self._log_verdict(intent, created, "PaymentID")
-        entity = created.entity
+        ours = self._payments_referenced(deal, reference)
+        if len(ours) > 1:
+            raise UnresolvableStep(
+                deal.deal_id,
+                STEP_PAYMENT,
+                f"{len(ours)} payments carrying reference {reference!r} exist on invoice "
+                f"{deal.xero_invoice_id}: {[p['PaymentID'] for p in ours]}; refusing to pick one",
+            )
+        if ours:
+            entity = ours[0]
+            log.info(
+                "resolve %s step=payment[%s] by Reference -> ADOPT (PaymentID=%s)",
+                deal.deal_id,
+                ref,
+                entity["PaymentID"],
+            )
+        else:
+            log.info("resolve %s step=payment[%s] by Reference -> PROVEN ABSENT", deal.deal_id, ref)
+            body = {
+                "Invoice": {"InvoiceID": deal.xero_invoice_id},
+                "Account": {"Code": BANK_ACCOUNT_CODE},
+                "Date": payment.paid_at[:10],
+                "Amount": payment.amount,
+                "Reference": reference,
+            }
+            self._seam("before_payment_send")
+            created = self.client.create_payment(body, idempotency_key=intent.idempotency_key)
+            self._log_verdict(intent, created, "PaymentID")
+            entity = created.entity
         self._seam("after_payment_response")
         self.ledger.finish_step(deal.deal_id, STEP_PAYMENT, ref, entity["PaymentID"])
         self.ledger.bind_payment(deal.deal_id, ref, entity["PaymentID"])
+
+    def _payments_referenced(self, deal: Deal, reference: str) -> list[dict[str, Any]]:
+        """The payments on our invoice that carry the reference we planted.
+
+        ``Reference`` is not unique in Xero, so this is a count, not a get.
+        Exactly one is ours. Zero means ours never landed. More than one
+        means somebody already duplicated, and picking one is a guess.
+        Looked up before **every** send, not only in recovery: a payment has
+        no unique field whose refusal could tell us afterwards.
+        """
+        assert deal.xero_invoice_id is not None
+        invoice = self.client.get_invoice(deal.xero_invoice_id)
+        assert invoice is not None
+        return [p for p in invoice.get("Payments") or [] if p.get("Reference") == reference]
 
     def _read_back_balance(self, deal: Deal) -> None:
         """State the balance from Xero; never add the webhook's amount to a counter.
