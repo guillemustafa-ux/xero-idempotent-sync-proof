@@ -20,16 +20,18 @@ decide whether an integration is exactly-once or merely usually-once:
   payments only on an ``AUTHORISED`` invoice, never above ``AmountDue``, and
   the payment ``Reference`` is **not** unique -- the invoice's ``Payments[]``
   is the only place to count them.
-* **Projects API** behind a switchable gate (``403`` when the organisation's
-  plan does not include it); the list filters on ``contactID`` and is paged
-  (``pageSize`` 1..500, default 50, ``pagination.pageCount`` in the body);
-  project names are **not** enforced unique.
+* **Projects API** behind two gates that both answer ``403``: the token
+  lacking the ``projects`` scope, and the organisation's plan not including
+  Projects (switchable). The list filters on ``contactID`` and is paged
+  (``pageSize`` 1..500, default 50, ``pagination.pageCount`` in the body).
 * **OAuth refresh rotation**: every refresh returns a new refresh token; the
   previous one keeps working for a **30-minute grace period**, then
-  ``invalid_grant``. Access tokens live 30 minutes.
+  ``invalid_grant``. Access tokens live 30 minutes. The token response
+  echoes the granted ``scope``.
 * **Rate limiting**: ``429`` with ``X-Rate-Limit-Problem`` and
   ``Retry-After``; ``X-MinLimit-Remaining`` / ``X-DayLimit-Remaining`` on
-  every normal response.
+  every normal response. Armed per test (``throttle_next``); the 60/min and
+  5-concurrent limits themselves are **not enforced** by counting.
 * **``xero-tenant-id``** required on every API call; ``GET /connections``
   lists the tenant; ``GET /Organisation`` says ``IsDemoCompany: true``.
 
@@ -44,8 +46,22 @@ not verified against Xero:
   "active contacts"; the harder reading is modelled);
 * the wording of the duplicate-``ContactNumber`` 400 (default: the Name
   message's shape; see ``answer_number_collisions_with``);
+* ``GET /Contacts/{ContactNumber}`` for a number nobody carries answers
+  **404** (the docs say the number is a valid path key, not what a miss
+  returns);
+* ``where=Name=="..."`` is modelled **case-insensitive only**; the docs say
+  the optimised filters are case- *and accent*-insensitive, and the accent
+  part is not modelled;
 * a quote inside a ``where`` string literal is escaped as ``\\"``;
+* **project names are not unique** (a duplicate is simply a second project);
+  the docs do not state uniqueness either way, and this is the harder side;
+* a 403 from ``projects.xro`` with the ``projects`` scope granted means the
+  **plan** lacks Projects; the two 403s differ only in a body the client does
+  not rely on;
 * ``Idempotency-Key`` is honoured on the Projects API as on Accounting;
+* inside the grace period, a refresh with the **retired** token rotates
+  again and retires the *newest* token (the docs say the old one "can be
+  used" for 30 minutes; what happens to the new one is not stated);
 * the exact bodies of the 401, 403, 404 and 429 responses, which the client
   detects by status code rather than by shape;
 * the message for a payment on a non-``AUTHORISED`` invoice and for a
@@ -172,6 +188,8 @@ class XeroState:
     access_tokens: dict[str, tuple[str, float]] = field(default_factory=dict)  # token -> (client, exp)
     refresh_token: str = field(default_factory=lambda: "rt-" + secrets.token_hex(12))
     retired_refresh_tokens: dict[str, float] = field(default_factory=dict)  # token -> retired_at
+    # What the authorisation granted; echoed in every token response.
+    granted_scopes: str = SCOPES
     # Faults armed for the next matching request, popped as they fire.
     armed: list[tuple[str, str]] = field(default_factory=list)
     throttle_remaining: int = 0
@@ -635,7 +653,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "expires_in": ACCESS_TOKEN_TTL_SECONDS,
                     "token_type": "Bearer",
                     "refresh_token": new_refresh,
-                    "scope": SCOPES,
+                    "scope": state.granted_scopes,
                 },
             )
 
@@ -864,6 +882,12 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _projects(self, method: str, path: str, query: dict, body: Any) -> _Reply:
         state = self.state
+        if "projects" not in state.granted_scopes.split():
+            # A token without the scope is 403 too -- and the client cannot
+            # tell the two 403s apart by status. Assumption: the body shapes.
+            state.request_log.append(f"{method} {path} -> 403 (scope)")
+            return _Reply(403, self._problem(
+                403, "Forbidden", "AuthorizationUnsuccessful: the token lacks the projects scope"))
         if not state.projects_available:
             state.request_log.append(f"{method} {path} -> 403 (plan)")
             return _Reply(403, self._problem(
@@ -1007,6 +1031,11 @@ class FakeXero:
         """Change the (undocumented) wording of the duplicate-ContactNumber 400."""
         with self.state._lock:
             self.state.number_collision_message = message
+
+    def grant_scopes(self, scopes: str) -> None:
+        """What the authorisation granted (space-separated), as the token response will echo it."""
+        with self.state._lock:
+            self.state.granted_scopes = scopes
 
     def set_projects_available(self, available: bool) -> None:
         with self.state._lock:

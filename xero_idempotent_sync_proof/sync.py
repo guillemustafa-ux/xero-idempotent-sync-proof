@@ -27,10 +27,14 @@ Payment         ``Reference`` -- not        Look first, always: count the
                 unique                      payments on the invoice carrying
                                             our reference. One -> adopt; none
                                             -> create; more -> stop.
-Project         name -- not unique; the     Look first, always, under the
-                API may be absent from      contact. A 403 -> ``project_mode
-                the plan                    = unavailable`` in the ledger and
-                                            a notice. Never silently.
+Project         name -- not unique (an      Look first, always, under the
+                assumption; the docs do     contact, through every page. A
+                not say); the API may be    403 with the ``projects`` scope
+                absent from the plan        granted -> ``project_mode =
+                                            unavailable`` in the ledger and a
+                                            notice (assumption: that 403 is
+                                            the plan). Without the scope ->
+                                            escalate: the app's fault.
 ==============  ==========================  ==================================
 
 The rule behind the table: where Xero refuses a duplicate loudly, the
@@ -327,9 +331,26 @@ class SyncEngine:
         try:
             project = self._settle_project(deal, intent, name)
         except ProjectsApiUnavailable as exc:
-            # A definite answer: this organisation's plan has no Projects.
-            # Say so where the business reads it. The invoice and payments
-            # go on the contact either way -- in Xero they always do.
+            # A 403 from projects.xro has two causes that look the same on
+            # the wire: the token was not granted the ``projects`` scope, or
+            # the organisation's plan has no Projects. The first is the app's
+            # mistake and must not be filed as a plan limit: the token
+            # response says which scopes were granted, so check that first.
+            scopes = self.client.auth.granted_scopes()
+            if scopes is not None and "projects" not in scopes:
+                raise UnresolvableStep(
+                    deal.deal_id,
+                    STEP_PROJECT,
+                    f"the Projects API answered HTTP {exc.status}, and the app's token was "
+                    f"granted the scopes {sorted(scopes)} -- without 'projects'. This is the "
+                    "app's authorisation, not the organisation's plan: re-authorise with the "
+                    "projects scope rather than recording the project as unavailable",
+                ) from exc
+            # Assumption, not verified against Xero: with the scope granted,
+            # the 403 is read as "this organisation's plan has no Projects".
+            # The body is not relied on. Say so where the business reads it.
+            # The invoice and payments go on the contact either way -- in
+            # Xero they always do.
             self.ledger.set_step_mode(deal.deal_id, STEP_PROJECT, "", PROJECT_MODE_UNAVAILABLE)
             mode = PROJECT_MODE_UNAVAILABLE
             project_id = None

@@ -636,3 +636,16 @@ def test_a_payment_to_an_unknown_bank_account_is_refused_until_the_account_exist
         xero, "PUT", "/api.xro/2.0/Payments", token=token, body=payment(authorised_invoice, 10.0), key="b2"
     )
     assert status == 200 and len(xero.payments) == 1
+
+
+def test_the_token_carries_the_granted_scopes_and_projects_needs_its_own(xero_factory):
+    """``grant_scopes``: without ``projects`` in the token, projects.xro is 403 whatever the plan."""
+    xero = xero_factory(projects_available=True)
+    xero.grant_scopes("offline_access accounting.contacts accounting.invoices accounting.payments")
+    status, body, _ = refresh(xero, xero.refresh_token)
+    assert status == 200 and "projects" not in body["scope"].split()
+    token = body["access_token"]
+    status, body, _ = call(xero, "GET", "/projects.xro/2.0/Projects", token=token)
+    assert status == 403 and "scope" in json.dumps(body)
+    status, _, _ = call(xero, "GET", "/api.xro/2.0/Organisation", token=token)
+    assert status == 200, "the accounting scopes still work"

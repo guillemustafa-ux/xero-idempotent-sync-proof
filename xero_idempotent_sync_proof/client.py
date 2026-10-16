@@ -94,7 +94,14 @@ class XeroNotFound(XeroRejected):
 
 
 class ProjectsApiUnavailable(XeroRejected):
-    """The Projects API answered 403: this organisation's plan does not include it."""
+    """The Projects API answered 403.
+
+    Two causes look the same here: the organisation's plan does not include
+    Projects, or the token was not granted the ``projects`` scope. The sync
+    separates them with ``Authenticator.granted_scopes()``; reading the 403
+    as the plan when the scope is present is an assumption, not verified
+    against Xero.
+    """
 
 
 def validation_messages(body: str) -> list[str]:
@@ -306,7 +313,12 @@ class XeroClient:
         return self._create("Payments", body, idempotency_key)
 
     def get_contact(self, id_or_number: str) -> dict[str, Any] | None:
-        """By ``ContactID`` or by the planted ``ContactNumber``; ``None`` when absent."""
+        """By ``ContactID`` or by the planted ``ContactNumber``; ``None`` when absent.
+
+        Assumption, not verified against Xero: a ``ContactNumber`` nobody
+        carries answers 404 (the docs say the number is a valid path key, not
+        what a miss returns). Anything else is raised, never read as absent.
+        """
         try:
             resp = self._request("GET", self._accounting(f"Contacts/{id_or_number}"))
         except XeroNotFound:

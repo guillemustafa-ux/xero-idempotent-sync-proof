@@ -55,6 +55,9 @@ class Tokens:
     access_expires_at: float
     refresh_token: str
     refresh_expires_at: float
+    # The space-separated scopes the token response said were granted; None
+    # until the first refresh has been seen.
+    scope: str | None = None
 
 
 class TokenStore:
@@ -77,7 +80,8 @@ class TokenStore:
                 access_token       TEXT,
                 access_expires_at  REAL NOT NULL,
                 refresh_token      TEXT NOT NULL,
-                refresh_expires_at REAL NOT NULL
+                refresh_expires_at REAL NOT NULL,
+                scope              TEXT
             )
             """
         )
@@ -96,16 +100,18 @@ class TokenStore:
     def save(self, tokens: Tokens) -> None:
         self._conn.execute(
             "INSERT INTO oauth_tokens (id, access_token, access_expires_at, "
-            "refresh_token, refresh_expires_at) VALUES (1, ?, ?, ?, ?) "
+            "refresh_token, refresh_expires_at, scope) VALUES (1, ?, ?, ?, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET access_token = excluded.access_token, "
             "access_expires_at = excluded.access_expires_at, "
             "refresh_token = excluded.refresh_token, "
-            "refresh_expires_at = excluded.refresh_expires_at",
+            "refresh_expires_at = excluded.refresh_expires_at, "
+            "scope = excluded.scope",
             (
                 tokens.access_token,
                 tokens.access_expires_at,
                 tokens.refresh_token,
                 tokens.refresh_expires_at,
+                tokens.scope,
             ),
         )
 
@@ -143,6 +149,18 @@ class Authenticator:
         assert tokens.access_token is not None
         return tokens.access_token
 
+    def granted_scopes(self) -> set[str] | None:
+        """The scopes the last token response said were granted; ``None`` if never seen.
+
+        A 403 from an API that needs a scope the app was not granted looks
+        exactly like a 403 from a plan that lacks the product. This is how
+        the sync tells them apart.
+        """
+        tokens = self.store.load()
+        if tokens is None or tokens.scope is None:
+            return None
+        return set(tokens.scope.split())
+
     def refresh(self) -> Tokens:
         """Exchange the stored refresh token for a new pair, and persist BOTH.
 
@@ -160,6 +178,7 @@ class Authenticator:
             access_expires_at=issued_at + float(payload.get("expires_in", ACCESS_TOKEN_LIFETIME)),
             refresh_token=payload["refresh_token"],
             refresh_expires_at=issued_at + REFRESH_TOKEN_LIFETIME,
+            scope=payload.get("scope") or current.scope,
         )
         self.store.save(tokens)
         return tokens

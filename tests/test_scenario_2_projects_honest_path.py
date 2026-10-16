@@ -59,6 +59,31 @@ def test_an_organisation_without_projects_is_flagged_and_still_invoiced(
     assert any(r.endswith("-> 403 (plan)") for r in xero.request_log), "Projects was asked first"
 
 
+def test_a_403_with_the_projects_scope_missing_is_the_apps_fault_not_the_plans(
+    xero_with_projects, engine_factory, make_webhook
+):
+    """Two things answer 403 on ``projects.xro``: a plan without Projects, and a
+    token without the ``projects`` scope. Only the first is "unavailable to
+    this organisation". The token response says which scopes were granted;
+    when ``projects`` is not among them, recording ``project_mode =
+    unavailable`` would bury an authorisation mistake as a plan limit.
+    """
+    xero_with_projects.grant_scopes(
+        "offline_access accounting.contacts accounting.invoices accounting.payments"
+    )
+    engine = engine_factory(xero_with_projects)
+
+    with pytest.raises(UnresolvableStep) as exc:
+        engine.apply(make_webhook())
+
+    assert exc.value.step == STEP_PROJECT
+    assert "projects" in exc.value.detail and "scope" in exc.value.detail
+    deal = engine.ledger.get_deal("deal-1001")
+    assert deal.project_mode is None and deal.sync_status == SYNC_ERROR, "not recorded as unavailable"
+    assert xero_with_projects.invoices == {}, "nothing downstream until a human re-authorises"
+    assert engine.notices == []
+
+
 def test_an_organisation_with_projects_gets_a_real_project(
     xero_with_projects, engine_factory, make_webhook
 ):
