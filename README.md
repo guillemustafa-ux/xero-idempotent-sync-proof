@@ -264,7 +264,7 @@ tests/test_scenario_4_payments_and_ledger.py
   resolve deal-1001 step=payment[pay-1] key=xis-e5724cf0…4ee55 -> REPLAYED (PaymentID=95414622…a4adc4)
   test_two_workers_past_the_lookup_at_the_same_moment_book_one_payment PASSED
 
-102 passed
+119 passed
 ```
 
 Note the verdicts: **ADOPT**, **PROVEN ABSENT**, **CREATED NOW**,
