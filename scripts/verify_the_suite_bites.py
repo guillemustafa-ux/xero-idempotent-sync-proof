@@ -57,7 +57,7 @@ MUTATIONS = [
         "        intent = self.get_intent(deal_id, step, ref)\n"
         "        assert intent is not None\n"
         "        return intent",
-        new="        return Intent(deal_id, step, ref, key, mode, PENDING, None)",
+        new="        return Intent(deal_id, step, ref, key, mode, PENDING, None, 0)",
     ),
     Mutation(
         name="blind-retry-on-doubt",

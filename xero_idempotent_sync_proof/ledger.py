@@ -68,16 +68,25 @@ IDEMPOTENCY_TTL_SECONDS = 6 * 60
 CONTACT_NUMBER_MAX_LEN = 50
 
 
-def idempotency_key_for(deal_id: str, step: str, ref: str = "") -> str:
+def idempotency_key_for(deal_id: str, step: str, ref: str = "", attempt: int = 0) -> str:
     """Derive the ``Idempotency-Key`` -- deterministically, forever.
 
-    ``"xis-" + sha256(f"{deal_id}:{step}[:{ref}]")[:40]`` where ``ref`` is
-    the name variant for a contact or the CRM payment id for a payment. Any
-    process, at any later time, with no memory of the attempt, computes the
-    same one. ``str(uuid4())`` at call time is not an idempotency key: every
-    retry carries a fresh id and Xero has nothing to recognise.
+    ``"xis-" + sha256(f"{deal_id}:{step}[:{ref}][:attempt{n}]")[:40]`` where
+    ``ref`` is the name variant for a contact or the CRM payment id for a
+    payment. Any process, at any later time, with no memory of the attempt,
+    computes the same one. ``str(uuid4())`` at call time is not an
+    idempotency key: every retry carries a fresh id and Xero has nothing to
+    recognise.
+
+    ``attempt`` is 0 for the first send, and the key is then exactly what a
+    rebuilt ledger re-derives. It is bumped only when Xero **provably
+    rejected** the send with a validation ``400``: Xero caches that 400 under
+    the key for six minutes, so the corrected send needs a key Xero has never
+    seen. Nothing was created under the old key, so nothing can be doubled.
     """
     material = f"{deal_id}:{step}" + (f":{ref}" if ref else "")
+    if attempt:
+        material += f":attempt{attempt}"
     digest = hashlib.sha256(material.encode()).hexdigest()
     return f"xis-{digest[:40]}"
 
@@ -161,6 +170,7 @@ class Intent:
     mode: str | None
     state: str
     remote_id: str | None
+    attempt: int = 0
 
 
 class Ledger:
@@ -227,6 +237,7 @@ class Ledger:
                 mode            TEXT,
                 state           TEXT NOT NULL,
                 remote_id       TEXT,
+                attempt         INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (deal_id, step, ref)
             )
             """
@@ -304,9 +315,27 @@ class Ledger:
     ) -> Intent:
         """Commit the intent to send one step, and return the key for it.
 
-        This is the load-bearing line of the whole repo. It runs *before* the
-        network call, so a hard kill during the call leaves a durable row
-        saying "this step was in flight for this deal, with this key".
+        It runs *before* the network call, so a hard kill during the call
+        leaves a durable row saying "this step was in flight for this deal,
+        with this key". What that row buys, honestly:
+
+        * the next process **looks up before it resends** -- by the planted
+          ``ContactNumber`` or ``InvoiceNumber`` -- instead of resending and
+          leaning on Xero to refuse the duplicate. With the planted keys in
+          place, a sync without this row still ends with one entity: the
+          resend is refused, the refusal triggers the lookup. The row saves
+          the blind resend on the wire and removes the dependence on Xero's
+          refusal; it is not, on its own, what prevents the duplicate;
+        * the **variant** a contact settled on (``REJECTED`` for a name a
+          stranger holds) and the **attempt** a rejected step is at, so a
+          later process derives the right name and the right key without
+          re-provoking the 400s that taught the first process;
+        * the **mode** the project step chose.
+
+        Where it would be load-bearing on its own is a step with no plantable
+        key and a dead key window -- which this design has none of, by
+        construction. The second replica racing the first is settled by the
+        *derived* key, not by this row (see scenario 4).
         """
         key = idempotency_key_for(deal_id, step, ref)
         assert len(key) <= IDEMPOTENCY_KEY_MAX_LEN
@@ -346,6 +375,27 @@ class Ledger:
             "UPDATE intents SET state = ? WHERE deal_id = ? AND step = ? AND ref = ?",
             (REJECTED, deal_id, step, ref),
         )
+
+    def bump_attempt(self, deal_id: str, step: str, ref: str = "") -> Intent:
+        """Xero provably rejected this send: derive a fresh key for the next one.
+
+        A validation ``400`` is cached under its key for six minutes, so a
+        corrected resend under the same key gets the same 400 back. The
+        attempt counter is persisted, so every process derives the same new
+        key; the step stays ``PENDING`` and is looked up before the resend
+        like any other in-flight step. Nothing was created under the old key.
+        """
+        current = self.get_intent(deal_id, step, ref)
+        assert current is not None, "bump_attempt on a step that was never begun"
+        attempt = current.attempt + 1
+        self._conn.execute(
+            "UPDATE intents SET attempt = ?, idempotency_key = ? "
+            "WHERE deal_id = ? AND step = ? AND ref = ?",
+            (attempt, idempotency_key_for(deal_id, step, ref, attempt), deal_id, step, ref),
+        )
+        intent = self.get_intent(deal_id, step, ref)
+        assert intent is not None
+        return intent
 
     def get_intent(self, deal_id: str, step: str, ref: str = "") -> Intent | None:
         row = self._conn.execute(

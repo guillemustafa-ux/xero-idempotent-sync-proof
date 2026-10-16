@@ -144,6 +144,9 @@ class XeroState:
     clock: Callable[[], float] = time.time
     offset: float = 0.0
 
+    # The bank accounts payments may land in. One by default; removable, so a
+    # payment can be a real validation 400 whose cause later goes away.
+    bank_account_codes: set[str] = field(default_factory=lambda: {BANK_ACCOUNT_CODE})
     contacts: dict[str, dict[str, Any]] = field(default_factory=dict)
     invoices: dict[str, dict[str, Any]] = field(default_factory=dict)
     payments: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -796,7 +799,8 @@ class _Handler(BaseHTTPRequestHandler):
         if invoice is None:
             return _Reply(400, self._validation("The specified invoice could not be found", item))
         account = item.get("Account") or {}
-        if str(account.get("Code") or account.get("AccountID") or "") != BANK_ACCOUNT_CODE:
+        code = str(account.get("Code") or account.get("AccountID") or "")
+        if code not in state.bank_account_codes:
             return _Reply(400, self._validation("The specified account could not be found", item))
         if invoice["Status"] != "AUTHORISED":
             # Assumption: the exact message is not in the examples.
@@ -822,7 +826,7 @@ class _Handler(BaseHTTPRequestHandler):
             "Reference": item.get("Reference", ""),
             "IsReconciled": False,
             "Invoice": {"InvoiceID": invoice["InvoiceID"], "InvoiceNumber": invoice["InvoiceNumber"]},
-            "Account": {"Code": BANK_ACCOUNT_CODE},
+            "Account": {"Code": code},
             "UpdatedDateUTC": _dotnet_date(state.now()),
             "HasValidationErrors": False,
         }
@@ -968,6 +972,15 @@ class FakeXero:
         with self.state._lock:
             self.state.throttle_remaining = n
             self.state.retry_after = retry_after
+
+    def remove_bank_account(self, code: str) -> None:
+        """Payments to ``code`` are a validation 400 until ``add_bank_account`` puts it back."""
+        with self.state._lock:
+            self.state.bank_account_codes.discard(code)
+
+    def add_bank_account(self, code: str) -> None:
+        with self.state._lock:
+            self.state.bank_account_codes.add(code)
 
     def fail_next_with(self, status: int, n: int = 1) -> None:
         """Answer the next ``n`` API calls with a bare 5xx (HTML body), committing nothing."""

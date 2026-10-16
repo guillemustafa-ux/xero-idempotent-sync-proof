@@ -276,6 +276,7 @@ class SyncEngine:
                 return ours
             if exc.says(CONTACT_NAME_TAKEN):
                 return None  # a stranger holds the name; our number never landed
+            self._rejected(intent, exc)
             raise  # a real validation error: nothing to adopt, nothing to rename
         self._log_verdict(intent, created, "ContactID")
         return created.entity
@@ -353,9 +354,13 @@ class SyncEngine:
             )
             return found[0]
         log.info("resolve %s step=project by planted name -> PROVEN ABSENT", deal.deal_id)
-        created = self.client.create_project(
-            deal.xero_contact_id, name, idempotency_key=intent.idempotency_key
-        )
+        try:
+            created = self.client.create_project(
+                deal.xero_contact_id, name, idempotency_key=intent.idempotency_key
+            )
+        except XeroRejected as exc:
+            self._rejected(intent, exc)
+            raise
         self._log_verdict(intent, created, "projectId")
         return created.entity
 
@@ -428,6 +433,7 @@ class SyncEngine:
             created = self.client.create_invoice(body, idempotency_key=intent.idempotency_key)
         except XeroRejected as exc:
             if not exc.says(INVOICE_NUMBER_TAKEN):
+                self._rejected(intent, exc)
                 raise
             # The number is ours, and unique: the refusal says it landed.
             invoice = self._ours_by_invoice_number(deal, number)
@@ -476,7 +482,11 @@ class SyncEngine:
                 "Reference": reference,
             }
             self._seam("before_payment_send")
-            created = self.client.create_payment(body, idempotency_key=intent.idempotency_key)
+            try:
+                created = self.client.create_payment(body, idempotency_key=intent.idempotency_key)
+            except XeroRejected as exc:
+                self._rejected(intent, exc)
+                raise
             self._log_verdict(intent, created, "PaymentID")
             entity = created.entity
         self._seam("after_payment_response")
@@ -527,6 +537,28 @@ class SyncEngine:
             intent.idempotency_key,
         )
         return intent
+
+    def _rejected(self, intent: Intent, exc: XeroRejected) -> None:
+        """A real validation 400 that no lookup settles: Xero said no, and will say it again.
+
+        The 400 is cached under the key for six minutes, so a resend after the
+        cause is fixed would get the cached 400 back. Bump the persisted
+        attempt: the next send derives a key Xero has never seen. Only a 400
+        qualifies -- a 429 was never processed and keeps its key.
+        """
+        if exc.status != 400:
+            return
+        bumped = self.ledger.bump_attempt(intent.deal_id, intent.step, intent.ref)
+        log.info(
+            "rejected %s step=%s%s under key=%s (HTTP 400: %s); next send derives key=%s (attempt %d)",
+            intent.deal_id,
+            intent.step,
+            f"[{intent.ref}]" if intent.ref else "",
+            intent.idempotency_key,
+            "; ".join(exc.messages)[:160],
+            bumped.idempotency_key,
+            bumped.attempt,
+        )
 
     @staticmethod
     def _log_verdict(intent: Intent, created: Created, id_field: str) -> None:

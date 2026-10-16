@@ -612,3 +612,25 @@ def test_a_server_error_is_not_a_xero_body_and_commits_nothing(xero, token):
 
     status, _, _ = call(xero, "PUT", "/api.xro/2.0/Contacts", token=token, body=contact("Ana"), key="s1")
     assert status == 200 and len(xero.contacts) == 1, "only the one armed answer fails"
+
+
+def test_a_payment_to_an_unknown_bank_account_is_refused_until_the_account_exists(
+    xero, token, authorised_invoice
+):
+    """``remove_bank_account`` / ``add_bank_account``: a validation 400 whose cause can go away."""
+    xero.remove_bank_account(BANK_ACCOUNT_CODE)
+    status, body, _ = call(
+        xero, "PUT", "/api.xro/2.0/Payments", token=token, body=payment(authorised_invoice, 10.0), key="b1"
+    )
+    assert status == 400 and "The specified account could not be found" in messages(body)
+    assert xero.payments == {}
+
+    xero.add_bank_account(BANK_ACCOUNT_CODE)
+    status, _, headers = call(
+        xero, "PUT", "/api.xro/2.0/Payments", token=token, body=payment(authorised_invoice, 10.0), key="b1"
+    )
+    assert status == 400 and headers["X-Fake-Replayed"] == "true", "same key: the cached 400, cause or no cause"
+    status, _, _ = call(
+        xero, "PUT", "/api.xro/2.0/Payments", token=token, body=payment(authorised_invoice, 10.0), key="b2"
+    )
+    assert status == 200 and len(xero.payments) == 1

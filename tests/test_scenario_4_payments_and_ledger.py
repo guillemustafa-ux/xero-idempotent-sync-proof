@@ -15,7 +15,7 @@ import sqlite3
 
 import pytest
 
-from xero_idempotent_sync_proof.client import UnknownOutcome
+from xero_idempotent_sync_proof.client import UnknownOutcome, XeroRejected
 from xero_idempotent_sync_proof.fake_xero import IDEMPOTENCY_TTL_SECONDS, ROUTE_PAYMENT
 from xero_idempotent_sync_proof.ledger import (
     PENDING,
@@ -225,6 +225,49 @@ def test_two_payments_with_our_reference_escalate_instead_of_guessing(
     assert report.settled == [] and [d.deal_id for d in report.failed] == [deal_id]
     assert planted["PaymentID"] in report.failed[0].last_error
     assert len(xero.payments) == 2 and len(payment_puts(xero)) == 2, "recovery reported; it did not resend"
+
+
+def test_a_cached_rejection_does_not_pin_the_payment_for_six_minutes(
+    xero, engine_factory, make_webhook
+):
+    """Xero caches errors under the key too -- the second trap of the idempotency store.
+
+    The bank account the payment books to is not in the chart yet, so the
+    payment is a real 400. Resend the same key after the accountant adds the
+    account and Xero replays the cached 400 for six minutes. The sync records
+    the rejection on the deal, bumps the step's attempt, and the next send
+    goes out under a fresh derived key -- so the fix takes effect at once,
+    and nothing was ever created under the old key for it to duplicate.
+    """
+    webhook = make_webhook(amount=2500.0)
+    xero.remove_bank_account("090")
+    key0 = idempotency_key_for("deal-1001", STEP_PAYMENT, "pay-1")
+    key1 = idempotency_key_for("deal-1001", STEP_PAYMENT, "pay-1", attempt=1)
+    key2 = idempotency_key_for("deal-1001", STEP_PAYMENT, "pay-1", attempt=2)
+
+    engine = engine_factory(xero)
+    with pytest.raises(XeroRejected) as exc:
+        engine.apply(webhook)
+    assert exc.value.says("The specified account could not be found")
+    deal = engine.ledger.get_deal("deal-1001")
+    assert deal.sync_status == SYNC_ERROR and "The specified account could not be found" in deal.last_error
+    intent = engine.ledger.get_intent("deal-1001", STEP_PAYMENT, "pay-1")
+    assert intent.attempt == 1 and intent.idempotency_key == key1, "the next send will not hit the cache"
+
+    # Still broken, a moment later: a fresh key, a fresh 400, not a replay.
+    with pytest.raises(XeroRejected):
+        engine_factory(xero).apply(webhook)
+    assert [r.split("key=")[1] for r in payment_puts(xero)] == [key0, key1]
+    assert not any(r.startswith("REPLAY") for r in xero.request_log), "never the cached 400"
+
+    # The accountant adds the account. The clock has not moved at all.
+    xero.add_bank_account("090")
+    deal = engine_factory(xero).apply(webhook)
+
+    assert deal.sync_status == SYNC_SYNCED and len(xero.payments) == 1
+    assert deal.amount_paid == 2500.0 and deal.last_error is None
+    assert [r.split("key=")[1] for r in payment_puts(xero)] == [key0, key1, key2]
+    assert key0 in xero.idempotency_keys, "the cached 400 is still there; the sync simply stopped using it"
 
 
 def test_the_schema_refuses_a_second_binding(ledger_factory, make_webhook):
