@@ -24,6 +24,7 @@ from xero_idempotent_sync_proof.fake_xero import (
     CLIENT_SECRET,
     IDEMPOTENCY_TTL_SECONDS,
     REFRESH_GRACE_SECONDS,
+    REFRESH_TOKEN_TTL_SECONDS,
     ROUTE_CONTACT,
     ROUTE_PAYMENT,
     TENANT_ID,
@@ -649,3 +650,30 @@ def test_the_token_carries_the_granted_scopes_and_projects_needs_its_own(xero_fa
     assert status == 403 and "scope" in json.dumps(body)
     status, _, _ = call(xero, "GET", "/api.xro/2.0/Organisation", token=token)
     assert status == 200, "the accounting scopes still work"
+
+
+def test_a_refresh_token_dies_after_sixty_days_even_if_it_was_never_rotated(xero):
+    """Documented: refresh tokens live 60 days. An app idle that long re-authorises by hand."""
+    xero.advance(REFRESH_TOKEN_TTL_SECONDS - 1)
+    status, body, _ = refresh(xero, xero.refresh_token)
+    assert status == 200, "one second to spare"
+    fresh = body["refresh_token"]
+
+    xero.advance(REFRESH_TOKEN_TTL_SECONDS - 1)
+    status, body, _ = refresh(xero, fresh)
+    assert status == 200, "the rotated token got its own sixty days"
+
+    xero.advance(REFRESH_TOKEN_TTL_SECONDS + 1)
+    status, body, _ = refresh(xero, xero.refresh_token)
+    assert status == 400 and body["error"] == "invalid_grant" and "expired" in body["error_description"]
+
+
+def test_an_authorised_invoice_cannot_go_back_to_draft(xero, token, authorised_invoice):
+    for status_back in ("DRAFT", "SUBMITTED"):
+        status, body, _ = call(
+            xero, "POST", f"/api.xro/2.0/Invoices/{authorised_invoice}", token=token,
+            body={"Invoices": [{"Status": status_back}]},
+        )
+        assert status == 400, status_back
+        assert any("AUTHORISED" in m and status_back in m for m in messages(body))
+    assert xero.invoices[authorised_invoice]["Status"] == "AUTHORISED"

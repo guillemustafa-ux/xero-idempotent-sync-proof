@@ -26,8 +26,12 @@ decide whether an integration is exactly-once or merely usually-once:
   (``pageSize`` 1..500, default 50, ``pagination.pageCount`` in the body).
 * **OAuth refresh rotation**: every refresh returns a new refresh token; the
   previous one keeps working for a **30-minute grace period**, then
-  ``invalid_grant``. Access tokens live 30 minutes. The token response
+  ``invalid_grant``. A refresh token not used for **60 days** is
+  ``invalid_grant`` too. Access tokens live 30 minutes. The token response
   echoes the granted ``scope``.
+* **Invoice statuses**: ``DRAFT``/``SUBMITTED``/``AUTHORISED`` on create;
+  an ``AUTHORISED`` invoice never goes back to ``DRAFT`` or ``SUBMITTED``;
+  ``PAID`` and ``VOIDED`` are final.
 * **Rate limiting**: ``429`` with ``X-Rate-Limit-Problem`` and
   ``Retry-After``; ``X-MinLimit-Remaining`` / ``X-DayLimit-Remaining`` on
   every normal response. Armed per test (``throttle_next``); the 60/min and
@@ -187,6 +191,9 @@ class XeroState:
     # OAuth.
     access_tokens: dict[str, tuple[str, float]] = field(default_factory=dict)  # token -> (client, exp)
     refresh_token: str = field(default_factory=lambda: "rt-" + secrets.token_hex(12))
+    # When the current refresh token was issued; None until the fake starts.
+    # Documented: a refresh token lives 60 days.
+    refresh_token_issued_at: float | None = None
     retired_refresh_tokens: dict[str, float] = field(default_factory=dict)  # token -> retired_at
     # What the authorisation granted; echoed in every token response.
     granted_scopes: str = SCOPES
@@ -296,10 +303,15 @@ class XeroState:
     # -- OAuth ----------------------------------------------------------------
 
     def rotate(self) -> str:
-        """Retire the current refresh token and issue a new one."""
+        """Retire the current refresh token and issue a new one, good for another 60 days."""
         self.retired_refresh_tokens.setdefault(self.refresh_token, self.now())
         self.refresh_token = "rt-" + secrets.token_hex(12)
+        self.refresh_token_issued_at = self.now()
         return self.refresh_token
+
+    def refresh_token_expired(self) -> bool:
+        issued = self.refresh_token_issued_at
+        return issued is not None and self.now() - issued >= REFRESH_TOKEN_TTL_SECONDS
 
     def issue_access_token(self, client_id: str) -> str:
         token = "at-" + secrets.token_hex(12)
@@ -628,6 +640,13 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             presented = (form.get("refresh_token") or [""])[0]
             now = state.now()
+            if presented == state.refresh_token and state.refresh_token_expired():
+                # Sixty days without a refresh: only a human gets the app back in.
+                self._send_json(
+                    400,
+                    {"error": "invalid_grant", "error_description": "refresh token expired"},
+                )
+                return
             if presented == state.refresh_token:
                 pass
             elif presented in state.retired_refresh_tokens and (
@@ -746,7 +765,11 @@ class _Handler(BaseHTTPRequestHandler):
             if inv is None:
                 return _Reply(404, self._problem(404, "Not Found", f"invoice {ident}"))
             status = item.get("Status", inv["Status"])
-            if status not in INVOICE_STATUSES_ON_CREATE or inv["Status"] in ("PAID", "VOIDED"):
+            # Documented: DRAFT -> SUBMITTED/AUTHORISED/DELETED, AUTHORISED ->
+            # VOIDED. An AUTHORISED invoice never goes back to DRAFT or
+            # SUBMITTED; PAID and VOIDED are final.
+            backwards = inv["Status"] == "AUTHORISED" and status in ("DRAFT", "SUBMITTED")
+            if status not in INVOICE_STATUSES_ON_CREATE or inv["Status"] in ("PAID", "VOIDED") or backwards:
                 return _Reply(400, self._validation(
                     f"Invoice status cannot be changed from {inv['Status']} to {status}", item))
             inv["Status"] = status
@@ -958,6 +981,7 @@ class FakeXero:
         self, *, projects_available: bool = False, clock: Callable[[], float] | None = None
     ):
         self.state = XeroState(projects_available=projects_available, clock=clock or time.time)
+        self.state.refresh_token_issued_at = self.state.now()  # the authorisation flow just ran
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self._server.state = self.state  # type: ignore[attr-defined]
         self._server.daemon_threads = True
