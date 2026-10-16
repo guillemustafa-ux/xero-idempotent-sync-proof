@@ -37,6 +37,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
+from .ledger import AUTH_SCHEMA_VERSION, add_column_if_missing, schema_version, set_schema_version
+
 XERO_TOKEN_URL = "https://identity.xero.com/connect/token"
 
 ACCESS_TOKEN_LIFETIME = 30 * 60  # documented: 30 minutes
@@ -136,6 +138,11 @@ class TokenStore:
             )
             """
         )
+        # A store from version 1 has no ``scope`` column; CREATE TABLE IF
+        # NOT EXISTS leaves it that way, so it is added here.
+        if schema_version(self._conn, "auth") < 2:
+            add_column_if_missing(self._conn, "oauth_tokens", "scope", "TEXT")
+        set_schema_version(self._conn, "auth", AUTH_SCHEMA_VERSION)
 
     def close(self) -> None:
         self._conn.close()

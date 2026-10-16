@@ -136,6 +136,36 @@ def test_granted_scopes_are_read_from_the_access_token_jwt_not_from_the_response
     assert auth.granted_scopes() is None, "unknown, not empty"
 
 
+def test_a_token_store_from_before_the_scope_column_is_upgraded_on_open(db_path, xero, auth_factory):
+    """Same hazard as the ledger: an ``oauth_tokens`` table without ``scope`` must still open."""
+    import sqlite3
+
+    v1 = sqlite3.connect(db_path)
+    v1.executescript(
+        """
+        CREATE TABLE oauth_tokens (
+            id INTEGER PRIMARY KEY CHECK (id = 1), access_token TEXT, access_expires_at REAL NOT NULL,
+            refresh_token TEXT NOT NULL, refresh_expires_at REAL NOT NULL
+        );
+        """
+    )
+    v1.execute(
+        "INSERT INTO oauth_tokens (id, access_token, access_expires_at, refresh_token, refresh_expires_at) "
+        "VALUES (1, NULL, 0, ?, 0)",
+        (xero.refresh_token,),
+    )
+    v1.commit()
+    v1.close()
+
+    auth = auth_factory(xero)  # opens the store; the row already exists, so no bootstrap
+
+    stored = auth.store.load()
+    assert stored.refresh_token == xero.refresh_token and stored.scope is None
+    tokens = auth.refresh()
+    assert tokens.scope is not None and "projects" in auth.granted_scopes()
+    assert TokenStore(db_path).load().scope == tokens.scope, "the new column is written and read back"
+
+
 def test_an_expired_access_token_is_refreshed_on_401_and_the_call_retried(xero, client_factory):
     """Clocks disagree; the 401 is the truth. One refresh, one retry, no duplicate."""
     client = client_factory(xero)

@@ -67,6 +67,42 @@ IDEMPOTENCY_TTL_SECONDS = 6 * 60
 # Xero caps ContactNumber at 50 characters.
 CONTACT_NUMBER_MAX_LEN = 50
 
+# Schema versions, one per component sharing the SQLite file. Version 1 is
+# the first release; version 2 added ``intents.attempt`` (ledger) and
+# ``oauth_tokens.scope`` (auth). ``CREATE TABLE IF NOT EXISTS`` does nothing
+# to a table that already exists, so a pre-existing database is upgraded
+# column by column on open instead.
+LEDGER_SCHEMA_VERSION = 2
+AUTH_SCHEMA_VERSION = 2
+
+
+def schema_version(conn: sqlite3.Connection, component: str) -> int:
+    """The recorded schema version of ``component`` in this file; 0 when none was ever recorded."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_version (component TEXT PRIMARY KEY, version INTEGER NOT NULL)"
+    )
+    row = conn.execute("SELECT version FROM schema_version WHERE component = ?", (component,)).fetchone()
+    return int(row[0]) if row else 0
+
+
+def set_schema_version(conn: sqlite3.Connection, component: str, version: int) -> None:
+    conn.execute(
+        "INSERT INTO schema_version (component, version) VALUES (?, ?) "
+        "ON CONFLICT(component) DO UPDATE SET version = excluded.version",
+        (component, version),
+    )
+
+
+def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    """``ALTER TABLE ... ADD COLUMN`` when the column is not there yet; a no-op otherwise.
+
+    Idempotent, like everything else here: two processes opening the same
+    old file race to the same end state, and the second finds the column.
+    """
+    present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in present:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
 
 def idempotency_key_for(deal_id: str, step: str, ref: str = "", attempt: int = 0) -> str:
     """Derive the ``Idempotency-Key`` -- deterministically, forever.
@@ -261,6 +297,20 @@ class Ledger:
             "CREATE UNIQUE INDEX IF NOT EXISTS payments_xero_uq "
             "ON payments(xero_payment_id) WHERE xero_payment_id IS NOT NULL"
         )
+        self._upgrade()
+
+    def _upgrade(self) -> None:
+        """Bring a database written by an earlier version up to this schema.
+
+        A fresh file gets the full ``CREATE TABLE`` above and only needs the
+        version stamped. A file from version 1 has an ``intents`` table with
+        no ``attempt`` column, and ``CREATE TABLE IF NOT EXISTS`` left it
+        that way; the column is added here, with the default every old row
+        should carry.
+        """
+        if schema_version(self._conn, "ledger") < 2:
+            add_column_if_missing(self._conn, "intents", "attempt", "INTEGER NOT NULL DEFAULT 0")
+        set_schema_version(self._conn, "ledger", LEDGER_SCHEMA_VERSION)
 
     def close(self) -> None:
         self._conn.close()

@@ -8,6 +8,7 @@ import pytest
 
 from xero_idempotent_sync_proof.ledger import (
     IDEMPOTENCY_KEY_MAX_LEN,
+    LEDGER_SCHEMA_VERSION,
     PENDING,
     PROJECT_MODE_PROJECTS_API,
     PROJECT_MODE_UNAVAILABLE,
@@ -181,6 +182,56 @@ def test_project_mode_and_project_id_agree_or_the_schema_refuses(ledger_factory,
     with pytest.raises(sqlite3.IntegrityError):
         ledger.bind_project("deal-1001", "p-2", None)
     assert ledger.get_deal("deal-1001").xero_project_id == "p-1", "every refusal left the row as it was"
+
+
+def test_a_database_from_before_the_attempt_column_is_upgraded_on_open(db_path, ledger_factory):
+    """``CREATE TABLE IF NOT EXISTS`` does not add a column to a table that already exists.
+
+    A ledger written by the first version has an ``intents`` table without
+    ``attempt`` and no ``schema_version`` table. Opening it must add the
+    column (with its default), stamp the version, and leave the rows usable
+    -- not fail on the first ``SELECT *``.
+    """
+    v1 = sqlite3.connect(db_path)
+    v1.executescript(
+        """
+        CREATE TABLE deals (
+            deal_id TEXT PRIMARY KEY, couple_names TEXT NOT NULL, wedding_date TEXT NOT NULL,
+            contract_total REAL NOT NULL, xero_contact_id TEXT, xero_contact_name TEXT,
+            xero_contact_number TEXT, xero_project_id TEXT, project_mode TEXT, xero_invoice_id TEXT,
+            xero_invoice_number TEXT, amount_paid REAL NOT NULL DEFAULT 0,
+            amount_owed REAL NOT NULL DEFAULT 0, last_payment_at TEXT, sync_status TEXT NOT NULL,
+            last_error TEXT
+        );
+        CREATE TABLE payments (
+            deal_id TEXT NOT NULL, hubspot_payment_id TEXT NOT NULL, amount REAL NOT NULL,
+            paid_at TEXT NOT NULL, xero_payment_id TEXT, PRIMARY KEY (deal_id, hubspot_payment_id)
+        );
+        CREATE TABLE intents (
+            deal_id TEXT NOT NULL, step TEXT NOT NULL, ref TEXT NOT NULL DEFAULT '',
+            idempotency_key TEXT NOT NULL, mode TEXT, state TEXT NOT NULL, remote_id TEXT,
+            PRIMARY KEY (deal_id, step, ref)
+        );
+        INSERT INTO deals (deal_id, couple_names, wedding_date, contract_total, sync_status)
+            VALUES ('deal-old', '["A", "B"]', '2027-01-01', 100.0, 'pending');
+        INSERT INTO intents (deal_id, step, ref, idempotency_key, state)
+            VALUES ('deal-old', 'invoice', '', 'xis-old', 'pending');
+        """
+    )
+    v1.commit()
+    v1.close()
+
+    ledger = ledger_factory()
+
+    intent = ledger.get_intent("deal-old", STEP_INVOICE)
+    assert intent is not None and intent.attempt == 0 and intent.idempotency_key == "xis-old"
+    assert ledger.bump_attempt("deal-old", STEP_INVOICE).attempt == 1
+    columns = {r[1] for r in ledger._conn.execute("PRAGMA table_info(intents)")}
+    assert "attempt" in columns
+    assert ledger._conn.execute(
+        "SELECT version FROM schema_version WHERE component = 'ledger'"
+    ).fetchone()[0] == LEDGER_SCHEMA_VERSION
+    assert ledger_factory().get_intent("deal-old", STEP_INVOICE).attempt == 1, "a second open changes nothing"
 
 
 def test_balance_is_stated_not_added(ledger_factory, make_webhook):
