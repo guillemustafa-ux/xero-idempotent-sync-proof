@@ -66,8 +66,10 @@ not verified against Xero:
 * inside the grace period, a refresh with the **retired** token rotates
   again and retires the *newest* token (the docs say the old one "can be
   used" for 30 minutes; what happens to the new one is not stated);
-* the exact bodies of the 401, 403, 404 and 429 responses, which the client
-  detects by status code rather than by shape;
+* the exact bodies of the 401, 403 and 429 responses (a JSON problem shape
+  here) and of the **404, served as plain text** (``The resource you're
+  looking for cannot be found``, the body Xero commonly sends); the client
+  branches on the status code for all four and reads a body only on a 400;
 * the message for a payment on a non-``AUTHORISED`` invoice and for a
   ``ContactNumber`` over 50 characters (the names are not in the examples);
 * a replay returns the original **status code** as well as the body.
@@ -127,6 +129,10 @@ FAULT_BEFORE_COMMIT = "before_commit"  # nothing was created; safe to retry
 FAULT_AFTER_COMMIT = "after_commit"  # created, but the caller never hears so
 
 INVOICE_STATUSES_ON_CREATE = ("DRAFT", "SUBMITTED", "AUTHORISED")
+
+# The body of an Accounting 404: plain text, no JSON (an assumption on the
+# harder side; see ``_Handler._send_reply``).
+NOT_FOUND_TEXT = "The resource you're looking for cannot be found"
 
 # where=Name=="..." with \" and \\ escapes inside the literal.
 _WHERE_NAME_RE = re.compile(r'^\s*Name\s*==\s*"((?:[^"\\]|\\.)*)"\s*$')
@@ -342,9 +348,26 @@ class _Handler(BaseHTTPRequestHandler):
         return self._body_cache
 
     def _send_json(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
-        body = json.dumps(payload).encode("utf-8")
+        self._send_bytes(status, json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8", headers)
+
+    def _send_reply(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
+        """A route's reply, as Xero would shape it: JSON -- except the 404, which is plain text.
+
+        Assumption, modelled on the harder side: Xero's Accounting 404 is
+        commonly a text body (``The resource you're looking for cannot be
+        found``), not a JSON object. A client that reads the body's shape
+        before the status code never learns the resource is absent.
+        """
+        if status == 404 and payload is None:
+            self._send_bytes(status, NOT_FOUND_TEXT.encode("utf-8"), "text/plain; charset=utf-8", headers)
+            return
+        self._send_json(status, payload, headers)
+
+    def _send_bytes(
+        self, status: int, body: bytes, content_type: str, headers: dict[str, str] | None = None
+    ) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         for k, v in (headers or {}).items():
             self.send_header(k, v)
@@ -394,8 +417,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _problem(status: int, title: str, detail: str) -> dict[str, Any]:
-        # Assumption: the shape of Xero's non-validation errors. The client
-        # keys on the status code, not on this body.
+        # Assumption: the shape of Xero's 401, 403, 405 and 429 bodies. The
+        # client branches on the status code before it reads any of these;
+        # the 404 does not come through here at all (it is plain text, see
+        # ``_send_reply``).
         return {"Type": None, "Title": title, "Status": status, "Detail": detail,
                 "Instance": str(uuid.uuid4())}
 
@@ -491,7 +516,7 @@ class _Handler(BaseHTTPRequestHandler):
                     # it does not run the operation again. The original
                     # response -- a 400 included -- is returned verbatim.
                     state.request_log.append(f"REPLAY {method} {parsed.path} key={key}")
-                    self._send_json(
+                    self._send_reply(
                         record.status, record.payload, {**rate_headers, "X-Fake-Replayed": "true"}
                     )
                     return
@@ -509,7 +534,7 @@ class _Handler(BaseHTTPRequestHandler):
                 # Committed and remembered on this side; the caller never hears.
                 self._cut_the_wire()
                 return
-            self._send_json(reply.status, reply.payload, rate_headers)
+            self._send_reply(reply.status, reply.payload, rate_headers)
 
     def _authorised(self) -> str | None:
         auth = self.headers.get("Authorization") or ""
@@ -588,7 +613,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._projects(method, path, query, body)
         m = re.match(r"^/api\.xro/2\.0/(Organisation|Contacts|Invoices|Payments)(?:/([^/]+))?$", path)
         if not m:
-            return _Reply(404, self._problem(404, "Not Found", f"no such route: {path}"))
+            return _Reply(404, None)
         resource, ident = m.group(1), m.group(2)
         if resource == "Organisation" and method == "GET":
             return _Reply(200, self._envelope(Organisations=[self._organisation()]))
@@ -684,7 +709,7 @@ class _Handler(BaseHTTPRequestHandler):
             if ident is not None:
                 contact = state.contacts.get(ident) or state.contact_by_number(ident)
                 if contact is None:
-                    return _Reply(404, self._problem(404, "Not Found", f"contact {ident}"))
+                    return _Reply(404, None)
                 return _Reply(200, self._envelope(Contacts=[contact]))
             include_archived = (query.get("includeArchived") or ["false"])[0].lower() == "true"
             where = (query.get("where") or [None])[0]
@@ -741,7 +766,7 @@ class _Handler(BaseHTTPRequestHandler):
             if ident is not None:
                 inv = state.invoices.get(ident) or state.invoice_by_number(ident)
                 if inv is None:
-                    return _Reply(404, self._problem(404, "Not Found", f"invoice {ident}"))
+                    return _Reply(404, None)
                 return _Reply(200, self._envelope(Invoices=[inv]))
             rows = list(state.invoices.values())
             if "InvoiceNumbers" in query:
@@ -763,7 +788,7 @@ class _Handler(BaseHTTPRequestHandler):
             # POST /Invoices/{id}: only a status change is modelled.
             inv = state.invoices.get(ident) or state.invoice_by_number(ident)
             if inv is None:
-                return _Reply(404, self._problem(404, "Not Found", f"invoice {ident}"))
+                return _Reply(404, None)
             status = item.get("Status", inv["Status"])
             # Documented: DRAFT -> SUBMITTED/AUTHORISED/DELETED, AUTHORISED ->
             # VOIDED. An AUTHORISED invoice never goes back to DRAFT or
@@ -840,7 +865,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return _Reply(200, self._envelope(Payments=list(state.payments.values())))
             payment = state.payments.get(ident)
             if payment is None:
-                return _Reply(404, self._problem(404, "Not Found", f"payment {ident}"))
+                return _Reply(404, None)
             return _Reply(200, self._envelope(Payments=[payment]))
         if ident is not None:
             return _Reply(405, self._problem(405, "Not Modelled", "payment updates"))

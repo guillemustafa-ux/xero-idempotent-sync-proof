@@ -166,6 +166,25 @@ def test_a_5xx_is_an_unknown_outcome_not_a_rejection(xero, engine_factory, make_
     assert len(contact_puts(xero)) == 1, "the 503 never reached the route; the second send did"
 
 
+def test_a_400_without_a_xero_body_is_unknown_and_a_plain_404_is_absent(xero, client_factory):
+    """The body's shape is read only where the sync reads messages: the 400.
+
+    A 400 whose body is a gateway's HTML page was not written by Xero and is
+    no verdict on the write -> ``UnknownOutcome``. A 404 whose body is plain
+    text, which is how Xero commonly answers a miss, is still a 404 ->
+    ``None`` from the lookup, never "unknown".
+    """
+    client = client_factory(xero)
+    xero.fail_next_with(400)
+    with pytest.raises(UnknownOutcome) as exc:
+        client.create_contact(CONTACT, idempotency_key=KEY)
+    assert "400" in str(exc.value) and not isinstance(exc.value, XeroRejected)
+    assert xero.contacts == {}
+
+    assert client.get_contact("hs-deal-nobody") is None, "a plain-text 404 means absent"
+    assert client.get_invoice("HS-nobody") is None
+
+
 def test_throttling_that_would_outlast_the_key_window_stops_and_asks(
     xero, client_factory, engine_factory, make_webhook
 ):

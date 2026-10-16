@@ -82,7 +82,15 @@ def _send(req: urllib.request.Request) -> tuple[int, Any, dict[str, str]]:
             return resp.status, (json.loads(raw) if raw else {}), dict(resp.headers)
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode()
-        return exc.code, (json.loads(raw) if raw else {}), dict(exc.headers)
+        return exc.code, _body(raw), dict(exc.headers)
+
+
+def _body(raw: str) -> Any:
+    """JSON when it is JSON; the text itself otherwise (Xero's 404 is plain text)."""
+    try:
+        return json.loads(raw) if raw else {}
+    except ValueError:
+        return raw
 
 
 def messages(body: dict[str, Any]) -> list[str]:
@@ -317,8 +325,12 @@ def test_contact_number_must_be_unique_and_is_a_lookup_key(xero, token):
     assert status == 200 and body["Contacts"][0]["ContactID"] == contact_id
     status, body, _ = call(xero, "GET", f"/api.xro/2.0/Contacts/{contact_id}", token=token)
     assert status == 200 and body["Contacts"][0]["ContactNumber"] == "hs-1"
-    status, _, _ = call(xero, "GET", "/api.xro/2.0/Contacts/hs-missing", token=token)
+    status, body, headers = call(xero, "GET", "/api.xro/2.0/Contacts/hs-missing", token=token)
     assert status == 404
+    # Assumption, modelled on the harder side: Xero's 404 is commonly a plain
+    # text body, not JSON. A client must read the status, not the shape.
+    assert headers["Content-Type"].startswith("text/plain")
+    assert body == "The resource you're looking for cannot be found"
 
     status, body, _ = call(xero, "PUT", "/api.xro/2.0/Contacts", token=token, body=contact("Cid", "x" * 51))
     assert status == 400, "ContactNumber is capped at 50"

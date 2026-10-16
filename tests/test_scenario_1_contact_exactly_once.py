@@ -380,6 +380,27 @@ def test_a_number_collision_is_settled_by_the_lookup_whatever_the_message_says(
     assert len(lookups_by_number(xero, contact_number_for("deal-1001"))) == 1
 
 
+def test_a_plain_text_404_still_proves_the_number_absent(xero, engine_factory, make_webhook):
+    """Xero's 404 is commonly plain text, not a JSON body. It must still mean "absent".
+
+    A stranger holds variant 0 of the name. The 400 on the name sends the sync
+    to ``GET /Contacts/{ContactNumber}``, and the answer is a 404 whose body
+    is ``The resource you're looking for cannot be found`` -- no JSON. A
+    client that requires a Xero-shaped body before it reads the status turns
+    that into ``UnknownOutcome``, and every in-flight recovery and every
+    stranger-holds-the-name case stays unknown forever. The status is the
+    answer; the body is not needed to read a 404.
+    """
+    xero.plant_contact("Ana Perez & Tomas Ruiz")  # a stranger holds variant 0
+
+    deal = engine_factory(xero).apply(make_webhook())
+
+    assert deal.xero_contact_name == "Ana Perez & Tomas Ruiz (2027-03-14)"
+    assert deal.sync_status == SYNC_SYNCED and len(xero.contacts) == 2
+    assert len(lookups_by_number(xero, contact_number_for("deal-1001"))) == 1
+    # The fake's 404 body is pinned as text/plain in test_fake_xero.
+
+
 def test_a_holder_carrying_our_contact_number_is_adopted_not_suffixed(
     xero, engine_factory, make_webhook
 ):

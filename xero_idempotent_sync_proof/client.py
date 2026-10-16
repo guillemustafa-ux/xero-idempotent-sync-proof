@@ -29,9 +29,14 @@ concerns, not business ones:
   resend is processed as a new request, so the transport stops and raises
   ``UnknownOutcome`` instead. The sleeper is injectable so the proof does not
   sleep;
-* a **5xx**, or any answer whose body is not a Xero JSON body, is an
-  ``UnknownOutcome``, not a rejection: a gateway can answer 502 after the
-  request was handed on, and a 500 can come back after the row was committed.
+* the **status code is read first**: a 401 refreshes once, a 404 is
+  ``XeroNotFound`` (Xero's 404 is commonly plain text, so the body is not
+  required), a 429 is throttling, a Projects 403 is the product gate. Only
+  the remaining 4xx -- the 400 whose messages the sync reads -- must carry a
+  Xero JSON body to count as a definite "no". A **5xx**, or a 400-class
+  answer with no Xero body, is an ``UnknownOutcome``, not a rejection: a
+  gateway can answer 502 after the request was handed on, and a 500 can come
+  back after the row was committed.
 """
 
 from __future__ import annotations
@@ -90,7 +95,12 @@ class XeroRejected(Exception):
 
 
 class XeroNotFound(XeroRejected):
-    """``404``: the resource named in the URL does not exist."""
+    """``404``: the resource named in the URL does not exist.
+
+    Read from the status alone. The body is commonly plain text ("The
+    resource you're looking for cannot be found"), so ``messages`` is that
+    text or empty, never a parsed ``ValidationException``.
+    """
 
 
 class ProjectsApiUnavailable(XeroRejected):
@@ -233,20 +243,30 @@ class XeroClient:
                     return _Response(resp.status, parsed, dict(resp.headers))
             except urllib.error.HTTPError as exc:
                 raw = exc.read().decode("utf-8", "replace")
-                if exc.code >= 500 or not _looks_like_xero(raw):
-                    # The server, or something in front of it, failed. That
-                    # is not a verdict on the write: a gateway can time out
-                    # after handing the request on. Do not read it as "no".
-                    raise UnknownOutcome(
-                        f"{method} {url}: HTTP {exc.code} is not a Xero answer; the write's "
-                        f"fate is unknown: {raw[:120]!r}"
-                    ) from exc
-                # A 4xx with a Xero body: a definite answer.
+                # The status code is read FIRST. Xero's 404 is commonly plain
+                # text and its 429 and 401 carry nothing the client needs
+                # from the body; requiring a JSON body before reading the
+                # status would turn every "absent" into "unknown" -- and an
+                # in-flight recovery could never settle.
                 if exc.code == 401 and not refreshed:
                     # Access token expired under us. One refresh, one retry.
                     self.auth.refresh()
                     refreshed = True
                     continue
+                if exc.code == 404:
+                    raise XeroNotFound(exc.code, raw) from exc
+                if exc.code == 403 and url.startswith(self._projects()):
+                    raise ProjectsApiUnavailable(exc.code, raw) from exc
+                if exc.code >= 500 or (exc.code != 429 and not _looks_like_xero(raw)):
+                    # The server, or something in front of it, failed. That
+                    # is not a verdict on the write: a gateway can time out
+                    # after handing the request on. Do not read it as "no".
+                    # A 400 is a definite answer only when Xero wrote it,
+                    # which is where the body's shape is read.
+                    raise UnknownOutcome(
+                        f"{method} {url}: HTTP {exc.code} is not a Xero answer; the write's "
+                        f"fate is unknown: {raw[:120]!r}"
+                    ) from exc
                 if exc.code == 429:
                     if attempt >= self.max_throttle_retries:
                         raise XeroRejected(exc.code, raw) from exc
@@ -267,10 +287,7 @@ class XeroClient:
                     waited += wait
                     attempt += 1
                     continue
-                if exc.code == 403 and url.startswith(self._projects()):
-                    raise ProjectsApiUnavailable(exc.code, raw) from exc
-                if exc.code == 404:
-                    raise XeroNotFound(exc.code, raw) from exc
+                # A 4xx with a Xero body: a definite answer, nothing applied.
                 raise XeroRejected(exc.code, raw) from exc
             except TRANSPORT_ERRORS as exc:
                 # Nobody spoke. The write's fate is unknowable from here.
@@ -317,7 +334,8 @@ class XeroClient:
 
         Assumption, not verified against Xero: a ``ContactNumber`` nobody
         carries answers 404 (the docs say the number is a valid path key, not
-        what a miss returns). Anything else is raised, never read as absent.
+        what a miss returns), and that 404 may well be plain text. Anything
+        other than a 404 is raised, never read as absent.
         """
         try:
             resp = self._request("GET", self._accounting(f"Contacts/{id_or_number}"))
