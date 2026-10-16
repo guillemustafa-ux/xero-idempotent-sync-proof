@@ -314,8 +314,12 @@ def test_after_the_window_the_key_is_new_and_only_the_contact_number_settles_it(
     assert len(lookups_by_number(xero, contact_number_for("deal-1001"))) == 1
 
 
+@pytest.mark.parametrize(
+    "wait",
+    [pytest.param(0, id="inside-the-window"), pytest.param(IDEMPOTENCY_TTL_SECONDS + 1, id="after-the-window")],
+)
 def test_a_rebuilt_ledger_re_derives_every_key_and_number_and_creates_nothing(
-    xero, engine_factory, make_webhook, tmp_path
+    xero, engine_factory, make_webhook, tmp_path, wait
 ):
     """Why the keys and the planted numbers are derived and not merely persisted.
 
@@ -323,12 +327,17 @@ def test_a_rebuilt_ledger_re_derives_every_key_and_number_and_creates_nothing(
     webhook log -- and replay the webhook against an empty database. A
     process with no memory of the first run computes the same keys and the
     same ``ContactNumber`` and ``InvoiceNumber``, and nothing is created
-    twice.
+    twice. Inside the window the derived keys replay; after it there is no
+    key left, and the planted numbers are the only thing doing the settling
+    -- the replay against the contact is a 400 on the name, answered by the
+    lookup by number.
     """
     webhook = make_webhook()
     first = engine_factory(xero).apply(webhook)
     assert (len(xero.contacts), len(xero.invoices), len(xero.payments)) == (1, 1, 1)
 
+    xero.advance(wait)
+    assert bool(xero.idempotency_keys) == (wait == 0), "keys live inside the window only"
     rebuilt = engine_factory(xero, path=str(tmp_path / "rebuilt.db")).apply(webhook)
 
     assert (len(xero.contacts), len(xero.invoices), len(xero.payments)) == (1, 1, 1)
@@ -337,6 +346,14 @@ def test_a_rebuilt_ledger_re_derives_every_key_and_number_and_creates_nothing(
     assert rebuilt.xero_invoice_id == first.xero_invoice_id
     assert rebuilt.amount_paid == 2500.0 and rebuilt.amount_owed == 10000.0
     assert len(idempotency_key_for(webhook["deal_id"], "payment", "pay-1")) <= IDEMPOTENCY_KEY_MAX_LEN
+    replays = [r for r in xero.request_log if r.startswith("REPLAY")]
+    if wait == 0:
+        assert len(replays) == 2, "contact and invoice replayed under their derived keys"
+        assert not lookups_by_number(xero, contact_number_for("deal-1001"))
+    else:
+        assert replays == [], "no key to replay"
+        assert len(lookups_by_number(xero, contact_number_for("deal-1001"))) == 1, "settled by the number"
+        assert len(contact_puts(xero)) == 2, "the resend was refused on the name; that was the trigger"
 
 
 def test_a_number_collision_is_settled_by_the_lookup_whatever_the_message_says(

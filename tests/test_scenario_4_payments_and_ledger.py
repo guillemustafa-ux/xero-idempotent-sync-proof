@@ -16,9 +16,10 @@ import sqlite3
 import pytest
 
 from xero_idempotent_sync_proof.client import UnknownOutcome, XeroRejected
-from xero_idempotent_sync_proof.fake_xero import IDEMPOTENCY_TTL_SECONDS, ROUTE_PAYMENT
+from xero_idempotent_sync_proof.fake_xero import IDEMPOTENCY_TTL_SECONDS, ROUTE_INVOICE, ROUTE_PAYMENT
 from xero_idempotent_sync_proof.ledger import (
     PENDING,
+    STEP_INVOICE,
     STEP_PAYMENT,
     SYNC_ERROR,
     SYNC_SYNCED,
@@ -152,6 +153,93 @@ def test_naive_payment_retry_after_a_real_kill_pays_the_invoice_twice(
     assert invoice["AmountPaid"] == 5000.0, "the books now say the couple paid twice"
     assert invoice["AmountDue"] == 12500.0 - 5000.0
     assert len(payment_puts(xero)) == 2, "same key both times; the second was processed as new"
+
+
+def invoice_puts(xero) -> list[str]:
+    return [r for r in xero.request_log if r.startswith("PUT /api.xro/2.0/Invoices key=")]
+
+
+def test_an_invoice_survives_a_real_kill_between_200_and_persist(
+    xero, ledger_factory, engine_factory, run_child, make_webhook
+):
+    """Killed after Xero created the invoice, before the id was written.
+
+    The intent row says the invoice step was in flight, so recovery asks
+    ``GET /Invoices/{InvoiceNumber}`` first and adopts. On the wire: one
+    create, ever -- recovery did not resend and lean on "Invoice # must be
+    unique." to be told.
+    """
+    deal_id = ledger_factory().record_webhook(make_webhook(amount=2500.0))
+
+    run_child(xero, deal_id, crash_at="after_invoice_response")
+
+    killed = ledger_factory()
+    intent = killed.get_intent(deal_id, STEP_INVOICE)
+    assert intent is not None and intent.state == PENDING
+    assert killed.get_deal(deal_id).xero_invoice_id is None
+    assert len(xero.invoices) == 1 and xero.payments == {}
+
+    deal = engine_factory(xero).recover_all().settled[0]
+
+    assert len(xero.invoices) == 1, "adopted, not recreated"
+    assert deal.xero_invoice_id == next(iter(xero.invoices))
+    assert deal.xero_invoice_number == invoice_number_for(deal_id)
+    assert len(xero.payments) == 1 and deal.amount_paid == 2500.0
+    assert deal.sync_status == SYNC_SYNCED
+    assert len(invoice_puts(xero)) == 1, "looked up by the planted number; never resent"
+    assert f"GET /api.xro/2.0/Invoices/{invoice_number_for(deal_id)} key=-" in xero.request_log
+
+
+def test_a_lost_response_on_the_invoice_create_is_settled_by_its_number(
+    xero, engine_factory, make_webhook
+):
+    """Same hazard, no crash: the process is alive and still cannot tell."""
+    webhook = make_webhook(amount=2500.0)
+    xero.drop_response_after_commit(ROUTE_INVOICE)
+    with pytest.raises(UnknownOutcome):
+        engine_factory(xero).apply(webhook)
+    assert len(xero.invoices) == 1
+
+    deal = engine_factory(xero).apply(webhook)
+
+    assert len(xero.invoices) == 1 and deal.xero_invoice_id == next(iter(xero.invoices))
+    assert deal.sync_status == SYNC_SYNCED and len(xero.payments) == 1
+    assert len(invoice_puts(xero)) == 1, "one create on the wire, ever"
+
+
+def test_an_invoice_with_our_number_on_a_strangers_contact_is_escalated(
+    xero, engine_factory, ledger_factory, client_factory, make_webhook
+):
+    """``InvoiceNumber`` is unique, so the refusal says *an* invoice exists -- not whose.
+
+    Our derived number sits on an invoice that belongs to another contact
+    (a hand-keyed invoice, a CRM id reused). Paying our instalment against
+    it would book one couple's money on another's account. The sync names
+    both contacts and stops; nothing is created and nothing is paid.
+    """
+    client = client_factory(xero)
+    stranger = client.create_contact({"Name": "Someone Else"}, idempotency_key="s").entity
+    theirs = client.create_invoice(
+        {
+            "Type": "ACCREC",
+            "Contact": {"ContactID": stranger["ContactID"]},
+            "InvoiceNumber": invoice_number_for("deal-1001"),
+            "Status": "AUTHORISED",
+            "LineItems": [{"Description": "x", "Quantity": 1, "UnitAmount": 50.0, "AccountCode": "200"}],
+        },
+        idempotency_key="s-inv",
+    ).entity
+
+    with pytest.raises(UnresolvableStep) as exc:
+        engine_factory(xero).apply(make_webhook(amount=2500.0))
+
+    assert exc.value.step == STEP_INVOICE
+    assert theirs["InvoiceID"] in exc.value.detail and stranger["ContactID"] in exc.value.detail
+    deal = ledger_factory().get_deal("deal-1001")
+    assert deal.xero_contact_id is not None and deal.xero_contact_id in exc.value.detail
+    assert deal.xero_invoice_id is None and deal.sync_status == SYNC_ERROR
+    assert len(xero.invoices) == 1 and xero.payments == {}, "nothing created, nothing paid"
+    assert xero.invoices[theirs["InvoiceID"]]["AmountDue"] == 50.0
 
 
 def test_a_payment_survives_a_real_kill_between_200_and_persist(
