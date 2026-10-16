@@ -42,7 +42,9 @@ under may have expired by now.
 
 from __future__ import annotations
 
+import datetime
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -102,6 +104,25 @@ class UnresolvableStep(Exception):
         self.deal_id = deal_id
         self.step = step
         self.detail = detail
+
+
+def xero_date_to_iso(value: Any) -> str | None:
+    """``/Date(1518685950940+0000)/`` or ``2026-09-01[T...]`` -> ``2026-09-01``; else ``None``.
+
+    Xero's JSON renders dates in the .NET form; the fake does the same on
+    read-back. The day is taken in UTC, which is how the ``+0000`` reads.
+    """
+    if not value:
+        return None
+    text = str(value)
+    match = re.match(r"^/Date\((-?\d+)(?:[+-]\d{4})?\)/$", text)
+    if match:
+        moment = datetime.datetime.fromtimestamp(int(match.group(1)) / 1000, tz=datetime.timezone.utc)
+        return moment.date().isoformat()
+    try:
+        return datetime.date.fromisoformat(text[:10]).isoformat()
+    except ValueError:
+        return None
 
 
 def project_name_for(deal: Deal) -> str:
@@ -466,6 +487,15 @@ class SyncEngine:
             )
         if ours:
             entity = ours[0]
+            mismatch = self._payment_mismatch(entity, payment)
+            if mismatch:
+                raise UnresolvableStep(
+                    deal.deal_id,
+                    STEP_PAYMENT,
+                    f"the one payment carrying reference {reference!r} on invoice "
+                    f"{deal.xero_invoice_id} (PaymentID={entity['PaymentID']}) is not this "
+                    f"instalment: {mismatch}; refusing to adopt someone else's money",
+                )
             log.info(
                 "resolve %s step=payment[%s] by Reference -> ADOPT (PaymentID=%s)",
                 deal.deal_id,
@@ -493,14 +523,32 @@ class SyncEngine:
         self.ledger.finish_step(deal.deal_id, STEP_PAYMENT, ref, entity["PaymentID"])
         self.ledger.bind_payment(deal.deal_id, ref, entity["PaymentID"])
 
+    @staticmethod
+    def _payment_mismatch(entity: dict[str, Any], payment: Payment) -> str | None:
+        """Why the one payment carrying our reference is not ours -- or ``None``.
+
+        ``Reference`` is free text anyone can paste. A match on it is where
+        the search starts, not where it ends: the amount must be the CRM
+        instalment's, and the date, when both sides have one, the same day.
+        """
+        amount = round(float(entity.get("Amount") or 0), 2)
+        if amount != round(payment.amount, 2):
+            return f"Amount {amount} in Xero, {round(payment.amount, 2)} in the CRM"
+        ours = payment.paid_at[:10]
+        theirs = xero_date_to_iso(entity.get("Date"))
+        if ours and theirs and ours != theirs:
+            return f"Date {theirs} in Xero, {ours} in the CRM"
+        return None
+
     def _payments_referenced(self, deal: Deal, reference: str) -> list[dict[str, Any]]:
         """The payments on our invoice that carry the reference we planted.
 
         ``Reference`` is not unique in Xero, so this is a count, not a get.
-        Exactly one is ours. Zero means ours never landed. More than one
-        means somebody already duplicated, and picking one is a guess.
-        Looked up before **every** send, not only in recovery: a payment has
-        no unique field whose refusal could tell us afterwards.
+        Exactly one is ours -- once its amount and date agree with the CRM.
+        Zero means ours never landed. More than one means somebody already
+        duplicated, and picking one is a guess. Looked up before **every**
+        send, not only in recovery: a payment has no unique field whose
+        refusal could tell us afterwards.
         """
         assert deal.xero_invoice_id is not None
         invoice = self.client.get_invoice(deal.xero_invoice_id)

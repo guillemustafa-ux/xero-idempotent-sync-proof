@@ -270,6 +270,62 @@ def test_a_cached_rejection_does_not_pin_the_payment_for_six_minutes(
     assert key0 in xero.idempotency_keys, "the cached 400 is still there; the sync simply stopped using it"
 
 
+def test_a_strangers_payment_carrying_our_reference_is_not_adopted(
+    xero, engine_factory, ledger_factory, client_factory, make_webhook
+):
+    """``Reference`` is free text. One match is not proof; it must also be our money.
+
+    Someone keyed a 1.00 test payment onto the invoice and pasted our
+    reference into it. Counting gives exactly one, and adopting it would mark
+    a 2,500 instalment as booked. The sync compares ``Amount`` and ``Date``
+    with the CRM instalment and escalates on a mismatch; nothing is created.
+    """
+    webhook = make_webhook(amount=2500.0, paid_at="2026-09-01T10:00:00Z")
+    engine = engine_factory(xero)
+    deal_id = engine.ledger.record_webhook(webhook)
+    engine._ensure_contact(engine.ledger.get_deal(deal_id))
+    engine._ensure_project(engine.ledger.get_deal(deal_id))
+    engine._ensure_invoice(engine.ledger.get_deal(deal_id))
+    deal = engine.ledger.get_deal(deal_id)
+    stranger = client_factory(xero).create_payment(
+        {
+            "Invoice": {"InvoiceID": deal.xero_invoice_id},
+            "Account": {"Code": "090"},
+            "Date": "2026-09-01",
+            "Amount": 1.0,
+            "Reference": payment_reference_for(deal_id, "pay-1"),
+        },
+        idempotency_key="keyed-in-by-hand",
+    ).entity
+
+    with pytest.raises(UnresolvableStep) as exc:
+        engine_factory(xero).apply(webhook)
+
+    assert exc.value.step == STEP_PAYMENT
+    assert stranger["PaymentID"] in exc.value.detail and "1.0" in exc.value.detail and "2500.0" in exc.value.detail
+    after = ledger_factory()
+    assert after.get_deal(deal_id).sync_status == SYNC_ERROR
+    assert after.payments_for(deal_id)[0].xero_payment_id is None, "not adopted"
+    assert len(xero.payments) == 1 and len(payment_puts(xero)) == 1, "and not re-sent either"
+
+    # The same reference with the right amount on the wrong day is a mismatch too.
+    xero.payments.clear()
+    xero.invoices[deal.xero_invoice_id]["Payments"].clear()
+    client_factory(xero).create_payment(
+        {
+            "Invoice": {"InvoiceID": deal.xero_invoice_id},
+            "Account": {"Code": "090"},
+            "Date": "2026-09-02",
+            "Amount": 2500.0,
+            "Reference": payment_reference_for(deal_id, "pay-1"),
+        },
+        idempotency_key="keyed-in-by-hand-2",
+    )
+    with pytest.raises(UnresolvableStep) as exc:
+        engine_factory(xero).apply(webhook)
+    assert "2026-09-02" in exc.value.detail and "2026-09-01" in exc.value.detail
+
+
 def test_the_schema_refuses_a_second_binding(ledger_factory, make_webhook):
     """A last line of defence that does not depend on the code being right.
 

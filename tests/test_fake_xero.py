@@ -402,6 +402,8 @@ def test_payment_rules_and_the_invoice_read_back(xero, token, authorised_invoice
     assert status == 200
     first = body["Payments"][0]
     assert first["Status"] == "AUTHORISED" and first["Amount"] == 40.0
+    # Dates come back in Xero's JSON rendering, not as the ISO string sent.
+    assert first["Date"] == "/Date(1790899200000+0000)/", "2026-10-02 at UTC midnight"
 
     # Reference is NOT unique: a second payment with the same one is accepted.
     status, body, _ = call(

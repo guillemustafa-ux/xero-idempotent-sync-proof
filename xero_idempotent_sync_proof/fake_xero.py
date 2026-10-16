@@ -56,6 +56,7 @@ not verified against Xero:
 from __future__ import annotations
 
 import base64
+import datetime
 import hashlib
 import json
 import re
@@ -113,6 +114,20 @@ _WHERE_NAME_RE = re.compile(r'^\s*Name\s*==\s*"((?:[^"\\]|\\.)*)"\s*$')
 
 def _dotnet_date(now: float) -> str:
     return f"/Date({int(now * 1000)}+0000)/"
+
+
+def _dotnet_date_from_iso(value: Any) -> Any:
+    """Render a ``YYYY-MM-DD`` the caller sent the way Xero's JSON renders dates.
+
+    The official invoice examples show every date as ``/Date(ms+0000)/``.
+    Anything that is not an ISO date is echoed as given.
+    """
+    try:
+        day = datetime.date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return value
+    midnight = datetime.datetime(day.year, day.month, day.day, tzinfo=datetime.timezone.utc)
+    return _dotnet_date(midnight.timestamp())
 
 
 def _fingerprint(method: str, path: str, body: bytes) -> str:
@@ -821,7 +836,7 @@ class _Handler(BaseHTTPRequestHandler):
             "PaymentID": str(uuid.uuid4()),
             "PaymentType": "ACCRECPAYMENT",
             "Status": "AUTHORISED",
-            "Date": item.get("Date", ""),
+            "Date": _dotnet_date_from_iso(item.get("Date", "")),
             "Amount": amount,
             "Reference": item.get("Reference", ""),
             "IsReconciled": False,
