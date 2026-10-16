@@ -139,6 +139,64 @@ def test_two_projects_with_the_same_planted_name_escalate_instead_of_guessing(
     assert xero_with_projects.invoices == {}, "and nothing downstream was booked against a guess"
 
 
+def test_recovery_finds_the_planted_project_behind_hundreds_of_others(
+    xero_with_projects, ledger_factory, engine_factory, run_child, make_webhook
+):
+    """The Projects list is paged: 50 per page by default, 500 at most.
+
+    A busy contact -- a venue with hundreds of events -- pushes our project
+    off the first page. A lookup that reads one page sees nothing, concludes
+    "never landed", and creates a second project. The sync must ask for
+    ``pageSize=500``, filter by ``contactID`` (the documented spelling), and
+    walk every page ``pagination.pageCount`` announces.
+    """
+    engine = engine_factory(xero_with_projects)
+    deal_id = engine.ledger.record_webhook(make_webhook())
+    engine._ensure_contact(engine.ledger.get_deal(deal_id))
+    contact_id = engine.ledger.get_deal(deal_id).xero_contact_id
+    for n in range(520):  # more than one page even at the maximum page size
+        xero_with_projects.plant_project(contact_id, f"Engagement shoot {n:03d}")
+
+    run_child(xero_with_projects, deal_id, crash_at="after_project_response")
+    assert len(xero_with_projects.projects) == 521
+    ours = [p for p in xero_with_projects.projects.values() if p["name"] != f"Engagement shoot {0:03d}"
+            and not p["name"].startswith("Engagement shoot")]
+    assert len(ours) == 1
+
+    xero_with_projects.advance(IDEMPOTENCY_TTL_SECONDS + 1)  # no key left to replay
+    deal = engine_factory(xero_with_projects).recover_all()[0]
+
+    assert len(xero_with_projects.projects) == 521, "adopted from page 2, not recreated"
+    assert deal.xero_project_id == ours[0]["projectId"]
+    assert deal.sync_status == SYNC_SYNCED
+    assert len(project_posts(xero_with_projects)) == 1
+    pages = [r for r in xero_with_projects.request_log if r.startswith("GET /projects.xro/2.0/Projects")]
+    assert len(pages) >= 2, "page 1 did not have it; page 2 was asked for"
+
+
+def test_the_lookup_matches_the_planted_name_exactly_and_ignores_the_contacts_other_projects(
+    xero_with_projects, client_factory, engine_factory, make_webhook
+):
+    """A contact's other projects are not ours, and neither is a stranger's project with our name."""
+    engine = engine_factory(xero_with_projects)
+    deal_id = engine.ledger.record_webhook(make_webhook())
+    engine._ensure_contact(engine.ledger.get_deal(deal_id))
+    deal = engine.ledger.get_deal(deal_id)
+    name = project_name_for(deal)
+    xero_with_projects.plant_project(deal.xero_contact_id, "Engagement shoot")
+    xero_with_projects.plant_project(deal.xero_contact_id, name + " (rehearsal)")
+    stranger = xero_with_projects.plant_contact("Someone Else")
+    xero_with_projects.plant_project(stranger["ContactID"], name)
+    ours = xero_with_projects.plant_project(deal.xero_contact_id, name)
+
+    found = client_factory(xero_with_projects).find_projects(deal.xero_contact_id, name)
+    assert [p["projectId"] for p in found] == [ours["projectId"]]
+
+    synced = engine.sync(deal_id)
+    assert synced.xero_project_id == ours["projectId"], "adopted the one with our exact name"
+    assert len(xero_with_projects.projects) == 4, "nothing created"
+
+
 def test_a_lost_response_on_the_project_create_is_settled_by_the_name_lookup(
     xero_with_projects, engine_factory, make_webhook
 ):

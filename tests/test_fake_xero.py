@@ -435,18 +435,53 @@ def test_projects_are_gated_and_names_are_not_unique(xero_factory):
 
     status, body, _ = call(xero, "POST", "/projects.xro/2.0/Projects", token=token, body=project)
     assert status == 403 and "Projects" in json.dumps(body)
-    status, _, _ = call(xero, "GET", f"/projects.xro/2.0/Projects?contactId={contact_id}", token=token)
+    status, _, _ = call(xero, "GET", f"/projects.xro/2.0/Projects?contactID={contact_id}", token=token)
     assert status == 403
 
     xero.set_projects_available(True)
     status, body, _ = call(xero, "POST", "/projects.xro/2.0/Projects", token=token, body=project)
     assert status == 201 and body["contactId"] == contact_id and body["name"] == "Wedding 2027"
     status, body, _ = call(xero, "POST", "/projects.xro/2.0/Projects", token=token, body=project)
-    assert status == 201, "a duplicate name is accepted"
+    assert status == 201, "a duplicate name is accepted (assumption: names are not unique)"
     assert len(xero.projects) == 2
 
-    status, body, _ = call(xero, "GET", f"/projects.xro/2.0/Projects?contactId={contact_id}", token=token)
+    status, body, _ = call(xero, "GET", f"/projects.xro/2.0/Projects?contactID={contact_id}", token=token)
     assert status == 200 and len(body["items"]) == 2 and body["pagination"]["itemCount"] == 2
+
+
+def test_the_projects_list_is_paged_and_filters_on_contactID_only(xero_factory):
+    """Documented: ``contactID`` (capital ID), ``pageSize`` 1..500 defaulting to 50,
+    and a ``pagination`` block with ``pageCount``. The lowercase ``contactId``
+    of the response body is not a query parameter and is ignored."""
+    xero = xero_factory(projects_available=True)
+    token = token_for(xero)
+    ours = xero.plant_contact("Ours")["ContactID"]
+    theirs = xero.plant_contact("Theirs")["ContactID"]
+    for n in range(60):
+        xero.plant_project(ours, f"P{n:02d}")
+    xero.plant_project(theirs, "Not ours")
+
+    status, body, _ = call(xero, "GET", f"/projects.xro/2.0/Projects?contactID={ours}", token=token)
+    assert status == 200 and len(body["items"]) == 50, "50 per page by default"
+    assert body["pagination"] == {"page": 1, "pageSize": 50, "pageCount": 2, "itemCount": 60}
+
+    status, body, _ = call(
+        xero, "GET", f"/projects.xro/2.0/Projects?contactID={ours}&page=2", token=token
+    )
+    assert status == 200 and [p["name"] for p in body["items"]] == [f"P{n:02d}" for n in range(50, 60)]
+
+    status, body, _ = call(
+        xero, "GET", f"/projects.xro/2.0/Projects?contactID={ours}&pageSize=500", token=token
+    )
+    assert status == 200 and len(body["items"]) == 60 and body["pagination"]["pageCount"] == 1
+
+    status, body, _ = call(
+        xero, "GET", f"/projects.xro/2.0/Projects?contactId={ours}&pageSize=500", token=token
+    )
+    assert body["pagination"]["itemCount"] == 61, "contactId (lowercase) is not a filter"
+
+    status, _, _ = call(xero, "GET", "/projects.xro/2.0/Projects?pageSize=501", token=token)
+    assert status == 400, "pageSize must be between 1 and 500"
 
     status, body, _ = call(
         xero, "POST", "/projects.xro/2.0/Projects", token=token, body={"contactId": "missing", "name": "x"}

@@ -55,6 +55,9 @@ TRANSPORT_ERRORS = (
 
 MUTATING_METHODS = ("POST", "PUT", "PATCH")
 
+# The Projects list pages at 50 by default and allows up to 500.
+PROJECTS_PAGE_SIZE = 500
+
 # The fake marks an Idempotency-Key replay with this response header so the
 # log can say REPLAYED vs CREATED NOW. The real service does not send it;
 # nothing in the client *decides* anything based on it.
@@ -294,7 +297,32 @@ class XeroClient:
         return Created(resp.body, resp.headers.get(REPLAY_HEADER) == "true")
 
     def find_projects(self, contact_id: str, name: str) -> list[dict[str, Any]]:
-        items = self._request("GET", self._projects(query={"contactId": contact_id})).body.get(
-            "items", []
-        )
-        return [p for p in items if p.get("name") == name]
+        """Every project under ``contact_id`` whose name is exactly ``name``.
+
+        The list is paged -- 50 per page by default, 500 at most -- so a busy
+        contact pushes our project off the first page, and a lookup that
+        stops there concludes "never landed". Ask for the largest page, read
+        ``pagination.pageCount``, and walk every page. The documented query
+        parameter is ``contactID`` (capital ID); the body spells it
+        ``contactId``. Both filters are applied again client-side, so a
+        service that ignores the parameter cannot hand us a stranger's project.
+        """
+        found: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            body = self._request(
+                "GET",
+                self._projects(query={
+                    "contactID": contact_id,
+                    "page": str(page),
+                    "pageSize": str(PROJECTS_PAGE_SIZE),
+                }),
+            ).body
+            found.extend(
+                p for p in body.get("items", [])
+                if p.get("contactId") == contact_id and p.get("name") == name
+            )
+            page_count = int((body.get("pagination") or {}).get("pageCount") or 1)
+            if page >= page_count:
+                return found
+            page += 1

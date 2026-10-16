@@ -21,7 +21,9 @@ decide whether an integration is exactly-once or merely usually-once:
   the payment ``Reference`` is **not** unique -- the invoice's ``Payments[]``
   is the only place to count them.
 * **Projects API** behind a switchable gate (``403`` when the organisation's
-  plan does not include it); project names are **not** enforced unique.
+  plan does not include it); the list filters on ``contactID`` and is paged
+  (``pageSize`` 1..500, default 50, ``pagination.pageCount`` in the body);
+  project names are **not** enforced unique.
 * **OAuth refresh rotation**: every refresh returns a new refresh token; the
   previous one keeps working for a **30-minute grace period**, then
   ``invalid_grant``. Access tokens live 30 minutes.
@@ -88,6 +90,9 @@ REFRESH_GRACE_SECONDS = 30 * 60
 MINUTE_LIMIT = 60
 DAY_LIMIT = 1000
 APP_MINUTE_LIMIT = 10000
+# Projects API paging, from the OpenAPI spec: pageSize 1..500, default 50.
+PROJECTS_DEFAULT_PAGE_SIZE = 50
+PROJECTS_MAX_PAGE_SIZE = 500
 
 # Routes a fault can be armed on.
 ROUTE_CONTACT = "contact"
@@ -828,14 +833,32 @@ class _Handler(BaseHTTPRequestHandler):
                 if project is None:
                     return _Reply(404, {"message": f"project {ident} not found"})
                 return _Reply(200, project)
-            contact_id = (query.get("contactId") or [None])[0]
+            # Documented query parameters: ``contactID`` (capital ID; the
+            # response body spells it ``contactId``), ``states``, ``page``
+            # (default 1) and ``pageSize`` (1..500, default 50). Anything
+            # else -- ``contactId`` included -- is not a filter.
+            contact_id = (query.get("contactID") or [None])[0]
             items = state.projects_under(contact_id)
             if "states" in query:
                 wanted = set(query["states"][0].split(","))
                 items = [p for p in items if p["status"] in wanted]
+            try:
+                page = int((query.get("page") or ["1"])[0])
+                page_size = int((query.get("pageSize") or [str(PROJECTS_DEFAULT_PAGE_SIZE)])[0])
+            except ValueError:
+                return _Reply(400, {"message": "page and pageSize must be integers"})
+            if page < 1 or not 1 <= page_size <= PROJECTS_MAX_PAGE_SIZE:
+                return _Reply(400, {
+                    "message": f"pageSize must be between 1 and {PROJECTS_MAX_PAGE_SIZE}; "
+                    "page must be greater than 0"})
+            page_count = max(1, -(-len(items) // page_size))
+            start = (page - 1) * page_size
             return _Reply(200, {
-                "pagination": {"page": 1, "pageSize": 50, "pageCount": 1, "itemCount": len(items)},
-                "items": items,
+                "pagination": {
+                    "page": page, "pageSize": page_size, "pageCount": page_count,
+                    "itemCount": len(items),
+                },
+                "items": items[start:start + page_size],
             })
         if method != "POST" or ident is not None:
             return _Reply(405, {"message": "only POST /Projects and GET are modelled"})
