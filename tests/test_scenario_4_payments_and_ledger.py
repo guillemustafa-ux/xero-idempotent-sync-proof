@@ -407,6 +407,55 @@ def test_two_replicas_with_unequal_rejection_counts_still_book_one_payment(
     assert ours == theirs == set(xero.payments), "both ledgers bound the same PaymentID"
 
 
+def test_a_payment_intent_bumped_by_an_earlier_version_is_pinned_back_to_attempt_zero(
+    xero, engine_factory, make_webhook, ledger_factory
+):
+    """A database written while payments still bumped their attempt keeps the bumped key on disk.
+
+    The first version of the attempt counter bumped every rejected step,
+    payments included, so an upgraded ledger can hold a payment intent at
+    ``attempt 1`` with the ``...:attempt1`` key stored. Scenario 4p says why
+    that key must never reach the wire: a replica on a fresh ledger derives
+    attempt 0, and two keys for one instalment book it twice. Opening the
+    file pins every look-first intent back to attempt 0 and its derived
+    key, and the send goes out under that key -- the one every other
+    ledger derives.
+    """
+    webhook = make_webhook(amount=2500.0)
+    xero.remove_bank_account("090")
+    key0 = idempotency_key_for("deal-1001", STEP_PAYMENT, "pay-1")
+    key1 = idempotency_key_for("deal-1001", STEP_PAYMENT, "pay-1", attempt=1)
+    with pytest.raises(XeroRejected):
+        engine_factory(xero).apply(webhook)
+
+    # What the earlier version left behind: the payment intent bumped, the
+    # bumped key persisted, and no schema version recorded yet.
+    old = ledger_factory()
+    old._conn.execute(
+        "UPDATE intents SET attempt = 1, idempotency_key = ? WHERE step = ? AND ref = 'pay-1'",
+        (key1, STEP_PAYMENT),
+    )
+    old._conn.execute("DELETE FROM schema_version WHERE component = 'ledger'")
+    old.close()
+
+    xero.add_bank_account("090")
+    xero.advance(IDEMPOTENCY_TTL_SECONDS + 1)
+    engine = engine_factory(xero)
+    intent = engine.ledger.get_intent("deal-1001", STEP_PAYMENT, "pay-1")
+    assert intent.attempt == 0 and intent.idempotency_key == key0, "pinned back on open"
+    on_disk = engine.ledger._conn.execute(
+        "SELECT attempt, idempotency_key FROM intents WHERE step = ? AND ref = 'pay-1'", (STEP_PAYMENT,)
+    ).fetchone()
+    assert tuple(on_disk) == (0, key0), "rewritten on disk, not only in the object"
+
+    deal = engine.apply(webhook)
+
+    assert deal.sync_status == SYNC_SYNCED and len(xero.payments) == 1
+    sent = [r.split("key=")[1] for r in payment_puts(xero) if not r.startswith("REPLAY")]
+    assert sent[-1] == key0, f"the send after the upgrade carried {sent[-1]}, not the attempt-0 key"
+    assert key1 not in {r.split("key=")[1] for r in xero.request_log if "Payments key=" in r}
+
+
 def test_a_strangers_payment_carrying_our_reference_is_not_adopted(
     xero, engine_factory, ledger_factory, client_factory, make_webhook
 ):

@@ -42,6 +42,14 @@ STEP_PROJECT = "project"
 STEP_INVOICE = "invoice"
 STEP_PAYMENT = "payment"
 
+# The steps whose key may change after a provable rejection: only those Xero
+# refuses to duplicate on a planted unique field, where a second replica on
+# another attempt is refused on the number and adopts. A look-first step
+# (payment, project) is pinned to attempt 0 for good -- its one derived key
+# is what settles two replicas racing -- and the ledger enforces that on
+# read and on open, whatever an earlier version left on disk.
+BUMP_ATTEMPT_ON_REJECTION = frozenset({STEP_CONTACT, STEP_INVOICE})
+
 # Intent lifecycle.
 PENDING = "pending"  # sent, or about to be; fate unknown
 DONE = "done"  # remote id known and persisted
@@ -69,10 +77,11 @@ CONTACT_NUMBER_MAX_LEN = 50
 
 # Schema versions, one per component sharing the SQLite file. Version 1 is
 # the first release; version 2 added ``intents.attempt`` (ledger) and
-# ``oauth_tokens.scope`` (auth). ``CREATE TABLE IF NOT EXISTS`` does nothing
-# to a table that already exists, so a pre-existing database is upgraded
-# column by column on open instead.
-LEDGER_SCHEMA_VERSION = 2
+# ``oauth_tokens.scope`` (auth); ledger version 3 pins every look-first
+# intent back to attempt 0 (an earlier version bumped payments too). ``CREATE
+# TABLE IF NOT EXISTS`` does nothing to a table that already exists, so a
+# pre-existing database is upgraded on open instead.
+LEDGER_SCHEMA_VERSION = 3
 AUTH_SCHEMA_VERSION = 2
 
 
@@ -306,11 +315,31 @@ class Ledger:
         version stamped. A file from version 1 has an ``intents`` table with
         no ``attempt`` column, and ``CREATE TABLE IF NOT EXISTS`` left it
         that way; the column is added here, with the default every old row
-        should carry.
+        should carry. A file from before version 3 may hold a payment or
+        project intent that an earlier version bumped; its stored key is the
+        one a replica on a fresh ledger would never derive, so the row is
+        pinned back to attempt 0 and the derived key before anything is sent.
         """
-        if schema_version(self._conn, "ledger") < 2:
+        version = schema_version(self._conn, "ledger")
+        if version < 2:
             add_column_if_missing(self._conn, "intents", "attempt", "INTEGER NOT NULL DEFAULT 0")
+        if version < 3:
+            self._pin_look_first_intents_to_attempt_zero()
         set_schema_version(self._conn, "ledger", LEDGER_SCHEMA_VERSION)
+
+    def _pin_look_first_intents_to_attempt_zero(self) -> None:
+        bumpable = sorted(BUMP_ATTEMPT_ON_REJECTION)
+        rows = self._conn.execute(
+            f"SELECT deal_id, step, ref FROM intents WHERE attempt > 0 "
+            f"AND step NOT IN ({', '.join('?' * len(bumpable))})",
+            bumpable,
+        ).fetchall()
+        for row in rows:
+            self._conn.execute(
+                "UPDATE intents SET attempt = 0, idempotency_key = ? "
+                "WHERE deal_id = ? AND step = ? AND ref = ?",
+                (idempotency_key_for(row["deal_id"], row["step"], row["ref"]), *row),
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -460,7 +489,15 @@ class Ledger:
             "SELECT * FROM intents WHERE deal_id = ? AND step = ? AND ref = ?",
             (deal_id, step, ref),
         ).fetchone()
-        return Intent(**dict(row)) if row else None
+        if row is None:
+            return None
+        intent = Intent(**dict(row))
+        if intent.step not in BUMP_ATTEMPT_ON_REJECTION and intent.attempt:
+            # A look-first step is on attempt 0 whatever the row says: the
+            # derived key is the one every other ledger derives too.
+            intent.attempt = 0
+            intent.idempotency_key = idempotency_key_for(intent.deal_id, intent.step, intent.ref)
+        return intent
 
     # -- bindings ---------------------------------------------------------
 

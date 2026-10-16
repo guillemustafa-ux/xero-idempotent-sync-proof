@@ -92,6 +92,7 @@ from typing import Any, Callable
 from .auth import AuthLockedOut, AuthNotBootstrapped
 from .client import Created, ProjectsApiUnavailable, UnknownOutcome, XeroClient, XeroRejected
 from .ledger import (
+    BUMP_ATTEMPT_ON_REJECTION,
     IDEMPOTENCY_TTL_SECONDS,
     PROJECT_MODE_PROJECTS_API,
     PROJECT_MODE_UNAVAILABLE,
@@ -131,9 +132,8 @@ MAX_NAME_VARIANTS = 2
 SALES_ACCOUNT_CODE = "200"
 BANK_ACCOUNT_CODE = "090"
 
-# The steps whose key may change after a provable rejection: only those Xero
-# refuses to duplicate on a planted unique field. See ``SyncEngine._rejected``.
-BUMP_ATTEMPT_ON_REJECTION = frozenset({STEP_CONTACT, STEP_INVOICE})
+# Which steps may bump their key after a provable rejection is the ledger's
+# rule (``BUMP_ATTEMPT_ON_REJECTION``); ``SyncEngine._rejected`` applies it.
 
 # Xero's refusals, by the fragment the sync keys on. Both are verbatim from
 # the official OpenAPI examples. The duplicate-ContactNumber refusal has no
