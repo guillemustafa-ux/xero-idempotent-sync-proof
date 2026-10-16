@@ -6,7 +6,10 @@ that mattered. So this script reintroduces, one at a time, the seven defects
 this design exists to prevent, and reports which tests catch each one.
 
 Every mutation is applied to a real source file, the suite is run against it,
-and the file is restored afterwards (even if the run is interrupted).
+and the file is restored afterwards (even if the run is interrupted). The
+working tree must be clean before the run -- a mutation and an uncommitted
+edit would be indistinguishable -- and is checked clean again at the end, so
+"restored" is verified rather than assumed.
 
     python scripts/verify_the_suite_bites.py
 """
@@ -29,6 +32,9 @@ class Mutation:
     path: Path
     old: str
     new: str
+    # How the suite catches it, honestly: by a visible duplicate, by a request
+    # that should not be on the wire, or only by looking at the ledger.
+    evidence: str = ""
 
 
 MUTATIONS = [
@@ -39,15 +45,28 @@ MUTATIONS = [
         "attempt -- or a second replica -- sends a key Xero has never seen.",
         path=PKG / "ledger.py",
         old='    material = f"{deal_id}:{step}" + (f":{ref}" if ref else "")\n'
+        "    if attempt:\n"
+        '        material += f":attempt{attempt}"\n'
         "    digest = hashlib.sha256(material.encode()).hexdigest()\n"
         '    return f"xis-{digest[:40]}"',
         new="    import uuid\n\n"
         '    return f"xis-{uuid.uuid4().hex[:40]}"',
+        evidence="A visible duplicate: two replicas past the lookup both send, and "
+        "the second is no longer a replay (scenario 4), plus the keys asserted on "
+        "the wire in scenarios 1 and 3.",
     ),
     Mutation(
         name="no-durable-intent",
         defect="Send the step without recording the intent first, so a process "
         "killed mid-call wakes up believing nothing was ever tried.",
+        evidence="NOT a visible duplicate. With the external keys planted, recovery "
+        "without the row resends, Xero refuses on the planted ContactNumber or "
+        "InvoiceNumber, and the refusal triggers the same lookup -- one entity "
+        "either way. What the suite catches is the blind resend itself: request "
+        "counts on the fake's wire (one PUT, ever, in the crash tests of scenarios "
+        "1 and 4) and the intent row the crash tests read back. The row buys the "
+        "lookup-before-resend, the settled name variant, the attempt and the "
+        "project mode; it is not what prevents the duplicate here.",
         path=PKG / "ledger.py",
         old="        self._conn.execute(\n"
         '            "INSERT OR IGNORE INTO intents (deal_id, step, ref, idempotency_key, mode, state) "\n'
@@ -113,8 +132,19 @@ MUTATIONS = [
         path=PKG / "sync.py",
         old="        return self.client.get_contact(contact_number)",
         new="        return None  # the key will have replayed it",
+        evidence="A visible duplicate: a dated twin of the couple after the window "
+        "closes (scenario 1), and the rebuilt ledger after the window (scenarios 1 "
+        "and 4).",
     ),
 ]
+
+
+def working_tree_dirty() -> str:
+    """``git status --porcelain`` for the repo: empty when clean."""
+    proc = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True, check=True
+    )
+    return proc.stdout.strip()
 
 
 def run_suite() -> tuple[int, list[str]]:
@@ -135,6 +165,12 @@ def run_suite() -> tuple[int, list[str]]:
 
 
 def main() -> int:
+    dirty = working_tree_dirty()
+    if dirty:
+        print("the working tree must be clean before mutating (commit or stash first):")
+        print(dirty)
+        return 1
+
     baseline_code, baseline_failed = run_suite()
     print(f"baseline: {'PASS' if baseline_code == 0 else 'FAIL'}")
     if baseline_code != 0:
@@ -159,6 +195,8 @@ def main() -> int:
 
         print(f"\n[{mutation.name}]")
         print(f"  defect: {mutation.defect}")
+        if mutation.evidence:
+            print(f"  how it is caught: {mutation.evidence}")
         if code == 0:
             print("  CAUGHT BY: nothing -- the suite does not cover this defect")
             survived.append(mutation.name)
@@ -167,10 +205,15 @@ def main() -> int:
                 print(f"  caught by: {name}")
 
     print()
+    dirty = working_tree_dirty()
+    if dirty:
+        print("the source files were NOT restored cleanly:")
+        print(dirty)
+        return 1
     if survived:
         print(f"{len(survived)} mutation(s) survived: {', '.join(survived)}")
         return 1
-    print(f"all {len(MUTATIONS)} mutations were caught; the suite bites")
+    print(f"all {len(MUTATIONS)} mutations were caught; the suite bites (working tree clean again)")
     return 0
 
 

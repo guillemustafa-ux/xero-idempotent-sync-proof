@@ -42,6 +42,23 @@ refusal is the lookup trigger; where it does not, look before every send.
 And a step whose intent was already in flight when a previous process died
 is always looked up before anything is resent, because the key it was sent
 under may have expired by now.
+
+What the durable intent row buys, stated plainly: with the external keys
+planted, a resend without it ends in the same single entity -- Xero refuses
+the planted ``ContactNumber`` or ``InvoiceNumber`` and the refusal triggers
+the lookup. The row saves that blind resend, removes the dependence on Xero
+refusing, and keeps the settled name variant, the attempt and the project
+mode. It is the planted keys and the look-first rule that prevent the
+duplicate; the derived key, not the row, is what settles two replicas racing.
+
+Known limit -- several replicas sharing one refresh token: ``auth.py`` has
+no lock or compare-and-swap. If two replicas with separate token stores
+refresh the same token, the one that did not rotate is locked out thirty
+minutes later. The token store must be shared, or rotation serialised.
+
+A payment adopted by its planted ``Reference`` must also carry the CRM
+instalment's ``Amount`` and ``Date``; a stranger's payment that merely
+quotes our reference is escalated, never adopted.
 """
 
 from __future__ import annotations

@@ -12,6 +12,15 @@ doing anything else with the response.
 The access token itself lives 30 minutes. Expiry is handled both proactively
 (clock) and reactively (a 401 from the API triggers one refresh and one
 retry), because the two clocks are never quite the same.
+
+Known limit: **one token store per refresh token.** Two replicas that each
+hold a copy of the same refresh token in separate stores will both refresh;
+the one that refreshed second rotated the first one's token away, and the
+first is locked out once the 30-minute grace ends. There is no lock or
+compare-and-swap here. Either every replica reads and writes the same store
+(this SQLite file, or a shared secret store), or refreshes are serialised by
+something outside this module. The proof runs one process at a time against
+one store, so the limit is stated, not exercised.
 """
 
 from __future__ import annotations
