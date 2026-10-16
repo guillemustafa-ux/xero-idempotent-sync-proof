@@ -89,6 +89,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .auth import AuthLockedOut, AuthNotBootstrapped
 from .client import Created, ProjectsApiUnavailable, UnknownOutcome, XeroClient, XeroRejected
 from .ledger import (
     IDEMPOTENCY_TTL_SECONDS,
@@ -113,6 +114,12 @@ from .ledger import (
 )
 
 log = logging.getLogger("xero_sync")
+
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+# Failures that are nobody's deal: recorded on no row, and they stop the
+# recovery walk because every deal behind them would fail the same way.
+AUTH_ERRORS = (AuthLockedOut, AuthNotBootstrapped)
 
 # How many Name variants to try before escalating: the bare names, then the
 # names with the wedding date. A third collision is not a naming problem, it
@@ -155,14 +162,21 @@ def xero_date_to_iso(value: Any) -> str | None:
     """``/Date(1518685950940+0000)/`` or ``2026-09-01[T...]`` -> ``2026-09-01``; else ``None``.
 
     Xero's JSON renders dates in the .NET form; the fake does the same on
-    read-back. The day is taken in UTC, which is how the ``+0000`` reads.
+    read-back. The day is taken in UTC, which is how the ``+0000`` reads. The
+    milliseconds are *added to the epoch* rather than passed to
+    ``fromtimestamp``: a blank date comes back as a negative epoch
+    (``/Date(-62135596800000+0000)/``, .NET's ``DateTime.MinValue``), which
+    ``fromtimestamp`` refuses on Windows with ``OSError``.
     """
     if not value:
         return None
     text = str(value)
     match = re.match(r"^/Date\((-?\d+)(?:[+-]\d{4})?\)/$", text)
     if match:
-        moment = datetime.datetime.fromtimestamp(int(match.group(1)) / 1000, tz=datetime.timezone.utc)
+        try:
+            moment = _EPOCH + datetime.timedelta(milliseconds=int(match.group(1)))
+        except OverflowError:
+            return None
         return moment.date().isoformat()
     try:
         return datetime.date.fromisoformat(text[:10]).isoformat()
@@ -238,9 +252,15 @@ class SyncEngine:
         except UnresolvableStep as exc:
             self.ledger.set_status(deal_id, SYNC_ERROR, str(exc))
             raise
-        except (XeroRejected, UnknownOutcome) as exc:
+        except AUTH_ERRORS:
+            # Not this deal's doing, and no deal can do better: propagate
+            # without blaming the row.
+            raise
+        except Exception as exc:  # noqa: BLE001 -- recorded on the row, then re-raised
             # Recorded where the business reads it, then re-raised: the
             # caller decides whether to retry, the row says why it stopped.
+            # Every exception, not only the three domain ones: a database
+            # constraint or a programming error is still this deal's failure.
             self.ledger.set_status(deal_id, SYNC_ERROR, f"{type(exc).__name__}: {exc}")
             raise
         return self.ledger.get_deal(deal_id)
@@ -248,16 +268,21 @@ class SyncEngine:
     def recover_all(self) -> RecoveryReport:
         """Settle every deal left in doubt by a previous run -- each on its own.
 
-        One deal that has to be escalated, or whose Xero call fails, does not
-        stop the deals behind it: its reason is recorded on its row and the
-        walk continues. A recovery that aborted at the first exception would
-        leave every later deal in doubt until a human noticed.
+        One deal that has to be escalated, whose Xero call fails, or that
+        blows up on something nobody wrote a handler for does not stop the
+        deals behind it: its reason is recorded on its row and the walk
+        continues. A recovery that aborted at the first exception would leave
+        every later deal in doubt until a human noticed. The one thing that
+        does abort the walk is an authentication lockout: it is not any
+        deal's fault, and every deal behind it would fail the same way.
         """
         report = RecoveryReport()
         for pending in list(self.ledger.unresolved()):
             try:
                 report.settled.append(self.sync(pending.deal_id))
-            except (UnresolvableStep, XeroRejected, UnknownOutcome) as exc:
+            except AUTH_ERRORS:
+                raise
+            except Exception as exc:  # noqa: BLE001 -- ``sync`` recorded it on the row
                 log.warning("recovery left %s for a human: %s", pending.deal_id, exc)
                 report.failed.append(self.ledger.get_deal(pending.deal_id))
         return report
@@ -604,14 +629,20 @@ class SyncEngine:
 
         ``Reference`` is free text anyone can paste. A match on it is where
         the search starts, not where it ends: the amount must be the CRM
-        instalment's, and the date, when both sides have one, the same day.
+        instalment's, and the date the same day. A date that cannot be read
+        -- on either side -- is a mismatch, not a check skipped: adopting on
+        the amount alone is exactly the guess this step refuses to make.
         """
         amount = round(float(entity.get("Amount") or 0), 2)
         if amount != round(payment.amount, 2):
             return f"Amount {amount} in Xero, {round(payment.amount, 2)} in the CRM"
-        ours = payment.paid_at[:10]
+        ours = xero_date_to_iso(payment.paid_at)
         theirs = xero_date_to_iso(entity.get("Date"))
-        if ours and theirs and ours != theirs:
+        if theirs is None:
+            return f"Date {entity.get('Date')!r} in Xero could not be read as a day"
+        if ours is None:
+            return f"Date {payment.paid_at!r} in the CRM could not be read as a day"
+        if ours != theirs:
             return f"Date {theirs} in Xero, {ours} in the CRM"
         return None
 
@@ -625,10 +656,27 @@ class SyncEngine:
         send, not only in recovery: a payment has no unique field whose
         refusal could tell us afterwards.
         """
-        assert deal.xero_invoice_id is not None
-        invoice = self.client.get_invoice(deal.xero_invoice_id)
-        assert invoice is not None
+        invoice = self._bound_invoice(deal, STEP_PAYMENT)
         return [p for p in invoice.get("Payments") or [] if p.get("Reference") == reference]
+
+    def _bound_invoice(self, deal: Deal, step: str) -> dict[str, Any]:
+        """The invoice the ledger bound to this deal, read back from Xero -- or an escalation.
+
+        The ledger says it exists; Xero may disagree (voided and purged,
+        another tenant, a ledger restored from elsewhere). That is a human's
+        question, named with the id, not an assertion that aborts the
+        recovery walk for every deal behind this one.
+        """
+        assert deal.xero_invoice_id is not None, "steps run in order; the invoice is bound first"
+        invoice = self.client.get_invoice(deal.xero_invoice_id)
+        if invoice is None:
+            raise UnresolvableStep(
+                deal.deal_id,
+                step,
+                f"invoice {deal.xero_invoice_id} ({deal.xero_invoice_number}) is bound in the "
+                "ledger but cannot be read back from Xero (404); refusing to book against it",
+            )
+        return invoice
 
     def _read_back_balance(self, deal: Deal) -> None:
         """State the balance from Xero; never add the webhook's amount to a counter.
@@ -637,9 +685,7 @@ class SyncEngine:
         is one more non-idempotent write, and it drifts on the first
         redelivered webhook.
         """
-        assert deal.xero_invoice_id is not None
-        invoice = self.client.get_invoice(deal.xero_invoice_id)
-        assert invoice is not None
+        invoice = self._bound_invoice(deal, STEP_INVOICE)
         amount_paid = round(float(invoice["AmountPaid"]), 2)
         amount_owed = round(float(invoice["AmountDue"]), 2)
         booked = [p for p in self.ledger.payments_for(deal.deal_id) if p.xero_payment_id]

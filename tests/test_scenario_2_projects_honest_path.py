@@ -230,6 +230,43 @@ def test_recovery_settles_the_deals_it_can_and_reports_the_one_it_cannot(
     assert ledger_factory().payments_for("deal-b")[0].xero_payment_id == next(iter(xero_with_projects.payments))
 
 
+def test_recovery_records_an_unexpected_exception_on_its_deal_and_walks_on(
+    xero, ledger_factory, engine_factory, make_webhook, monkeypatch
+):
+    """Not every failure is one of the three domain exceptions.
+
+    A programming error, a database constraint, an ``OSError`` from a date --
+    whatever blows up inside one deal's sync is recorded on *that* deal's
+    row and the walk continues. Only an authentication lockout propagates:
+    it is not the deal's fault, and no deal behind it can do better.
+    """
+    ledger = ledger_factory()
+    ledger.record_webhook(make_webhook(deal_id="deal-a", couple_names=("Ana Perez", "Tomas Ruiz"), payment_id="pay-a"))
+    ledger.record_webhook(make_webhook(deal_id="deal-b", couple_names=("Bea Soto", "Ivo Lund"), payment_id="pay-b"))
+    engine = engine_factory(xero)
+    real = engine._ensure_project
+
+    def blow_up_on_a(deal):
+        if deal.deal_id == "deal-a":
+            raise RuntimeError("a bug nobody wrote a handler for")
+        return real(deal)
+
+    monkeypatch.setattr(engine, "_ensure_project", blow_up_on_a)
+    report = engine.recover_all()
+
+    assert [d.deal_id for d in report.failed] == ["deal-a"]
+    assert report.failed[0].sync_status == SYNC_ERROR
+    assert "RuntimeError" in report.failed[0].last_error and "nobody wrote a handler" in report.failed[0].last_error
+    assert [d.deal_id for d in report.settled] == ["deal-b"] and report.settled[0].sync_status == SYNC_SYNCED
+
+    from xero_idempotent_sync_proof.auth import AuthLockedOut
+
+    locked = engine_factory(xero)
+    monkeypatch.setattr(locked.client.auth, "access_token", lambda: (_ for _ in ()).throw(AuthLockedOut("invalid_grant")))
+    with pytest.raises(AuthLockedOut):
+        locked.recover_all()
+
+
 def test_recovery_finds_the_planted_project_behind_hundreds_of_others(
     xero_with_projects, ledger_factory, engine_factory, run_child, make_webhook
 ):

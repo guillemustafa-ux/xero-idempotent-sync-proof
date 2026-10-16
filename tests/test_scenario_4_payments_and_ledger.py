@@ -27,7 +27,7 @@ from xero_idempotent_sync_proof.ledger import (
     invoice_number_for,
     payment_reference_for,
 )
-from xero_idempotent_sync_proof.sync import UnresolvableStep, naive_payment_sync
+from xero_idempotent_sync_proof.sync import UnresolvableStep, naive_payment_sync, xero_date_to_iso
 
 
 def payment_puts(xero) -> list[str]:
@@ -461,6 +461,96 @@ def test_a_strangers_payment_carrying_our_reference_is_not_adopted(
     with pytest.raises(UnresolvableStep) as exc:
         engine_factory(xero).apply(webhook)
     assert "2026-09-02" in exc.value.detail and "2026-09-01" in exc.value.detail
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("/Date(1518685950940+0000)/", "2018-02-15"),  # the official example
+        ("/Date(1788220800000+1300)/", "2026-09-01"),  # an offset in the suffix: the day is read in UTC
+        ("/Date(-62135596800000+0000)/", "0001-01-01"),  # a negative epoch: .NET's DateTime.MinValue
+        ("2026-09-01T10:00:00", "2026-09-01"),
+        ("", None),
+        ("not-a-date", None),
+    ],
+)
+def test_xero_dates_are_read_including_negative_epochs(value, expected):
+    """Xero renders dates as ``/Date(ms+0000)/``; a blank date comes back as a negative epoch.
+
+    ``datetime.fromtimestamp`` refuses negative values on Windows (``OSError``),
+    which would have aborted a recovery walk on the first such payment. The
+    parser adds the milliseconds to the epoch instead.
+    """
+    assert xero_date_to_iso(value) == expected
+
+
+def test_a_payment_whose_date_cannot_be_read_is_a_mismatch_not_a_pass(
+    xero, engine_factory, ledger_factory, client_factory, make_webhook
+):
+    """One payment carries our reference with the right amount -- and a date nobody can read.
+
+    Skipping the date check when the date is unparseable would adopt it on
+    the amount alone. An unreadable date is a mismatch: escalate, name it,
+    adopt nothing, send nothing.
+    """
+    webhook = make_webhook(amount=2500.0, paid_at="2026-09-01T10:00:00Z")
+    engine = engine_factory(xero)
+    deal_id = engine.ledger.record_webhook(webhook)
+    engine._ensure_contact(engine.ledger.get_deal(deal_id))
+    engine._ensure_project(engine.ledger.get_deal(deal_id))
+    engine._ensure_invoice(engine.ledger.get_deal(deal_id))
+    deal = engine.ledger.get_deal(deal_id)
+    planted = client_factory(xero).create_payment(
+        {
+            "Invoice": {"InvoiceID": deal.xero_invoice_id},
+            "Account": {"Code": "090"},
+            "Date": "2026-09-01",
+            "Amount": 2500.0,
+            "Reference": payment_reference_for(deal_id, "pay-1"),
+        },
+        idempotency_key="keyed-in-by-hand",
+    ).entity
+    for row in xero.invoices[deal.xero_invoice_id]["Payments"]:
+        row["Date"] = "/Date(garbage)/"
+
+    with pytest.raises(UnresolvableStep) as exc:
+        engine_factory(xero).apply(webhook)
+
+    assert exc.value.step == STEP_PAYMENT and planted["PaymentID"] in exc.value.detail
+    assert "garbage" in exc.value.detail and "could not be read" in exc.value.detail
+    assert ledger_factory().payments_for(deal_id)[0].xero_payment_id is None, "not adopted"
+    assert len(xero.payments) == 1 and len(payment_puts(xero)) == 1, "and not re-sent either"
+
+
+def test_a_bound_invoice_that_cannot_be_read_back_is_escalated_not_crashed(
+    xero, engine_factory, ledger_factory, make_webhook
+):
+    """The ledger says the invoice exists; Xero answers 404 (voided and purged, wrong tenant, a restore).
+
+    Before: an ``assert invoice is not None`` -- an ``AssertionError`` that no
+    handler recorded and that aborted a recovery walk for every deal behind
+    it. Now: ``UnresolvableStep`` with the ids, recorded on the row, and the
+    walk goes on.
+    """
+    gone = make_webhook(deal_id="deal-gone", couple_names=("Ana Perez", "Tomas Ruiz"), payment_id="pay-g")
+    fine = make_webhook(deal_id="deal-fine", couple_names=("Bea Soto", "Ivo Lund"), payment_id="pay-f")
+    engine = engine_factory(xero)
+    engine.ledger.record_webhook(gone)
+    engine.ledger.record_webhook(fine)
+    engine._ensure_contact(engine.ledger.get_deal("deal-gone"))
+    engine._ensure_project(engine.ledger.get_deal("deal-gone"))
+    engine._ensure_invoice(engine.ledger.get_deal("deal-gone"))
+    bound = engine.ledger.get_deal("deal-gone").xero_invoice_id
+    del xero.invoices[bound]  # Xero no longer has it
+
+    report = engine_factory(xero).recover_all()
+
+    assert [d.deal_id for d in report.failed] == ["deal-gone"]
+    assert bound in report.failed[0].last_error and "cannot be read back" in report.failed[0].last_error
+    assert report.failed[0].sync_status == SYNC_ERROR
+    assert [d.deal_id for d in report.settled] == ["deal-fine"], "the deal behind it was still settled"
+    assert report.settled[0].sync_status == SYNC_SYNCED and len(xero.payments) == 1
+    assert ledger_factory().payments_for("deal-gone")[0].xero_payment_id is None
 
 
 def test_the_schema_refuses_a_second_binding(ledger_factory, make_webhook):
