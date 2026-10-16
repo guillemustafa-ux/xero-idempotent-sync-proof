@@ -84,6 +84,30 @@ def test_a_403_with_the_projects_scope_missing_is_the_apps_fault_not_the_plans(
     assert engine.notices == []
 
 
+def test_a_403_with_the_granted_scopes_unknown_is_escalated_not_filed_as_the_plan(
+    xero, engine_factory, make_webhook, monkeypatch
+):
+    """When the app cannot tell which scopes it holds, a 403 is not evidence about the plan.
+
+    The scopes live in the access token's JWT; a token that cannot be decoded
+    and a response without a ``scope`` field leave them unknown. Recording
+    ``project_mode = unavailable`` on that 403 would file what may be the
+    app's own authorisation mistake as a plan limit, for every deal, silently.
+    So: escalate, and say what could not be determined.
+    """
+    engine = engine_factory(xero)  # this organisation's plan has no Projects: a real 403
+    monkeypatch.setattr(type(engine.client.auth), "granted_scopes", lambda self: None)
+
+    with pytest.raises(UnresolvableStep) as exc:
+        engine.apply(make_webhook())
+
+    assert exc.value.step == STEP_PROJECT
+    assert "403" in exc.value.detail and "scope" in exc.value.detail and "unknown" in exc.value.detail
+    deal = engine.ledger.get_deal("deal-1001")
+    assert deal.project_mode is None and deal.sync_status == SYNC_ERROR, "not recorded as unavailable"
+    assert engine.notices == [] and xero.invoices == {}
+
+
 def test_an_organisation_with_projects_gets_a_real_project(
     xero_with_projects, engine_factory, make_webhook
 ):

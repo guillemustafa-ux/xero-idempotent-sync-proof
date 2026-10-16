@@ -97,6 +97,45 @@ def test_a_store_that_kept_the_old_refresh_token_is_locked_out_after_the_grace_p
     assert auth.store.load().refresh_token == original, "nothing new to persist; a human is needed"
 
 
+def test_granted_scopes_are_read_from_the_access_token_jwt_not_from_the_response(
+    xero, auth_factory, monkeypatch
+):
+    """The token response has no ``scope`` field; the access token is a JWT with a ``scope`` claim.
+
+    Three tokens, in order of what the app can learn: a JWT with the claim
+    (the documented shape) -> the set; an opaque token with a ``scope``
+    field in the response (not documented, but harmless to read) -> the set;
+    an opaque token and nothing else -> ``None``, "unknown", never an empty
+    set that reads as "nothing granted".
+    """
+    auth = auth_factory(xero)
+    assert auth.granted_scopes() is None, "nothing has been seen yet"
+
+    tokens = auth.refresh()
+    assert tokens.access_token.count(".") == 2, "the fake issues a JWT"
+    assert auth.granted_scopes() == {
+        "offline_access", "accounting.contacts", "accounting.invoices", "accounting.payments",
+        "accounting.settings.read", "projects",
+    }
+
+    def opaque(payload_scope: str | None):
+        def post(_refresh_token: str) -> dict:
+            payload = {"access_token": "opaque-" + "x" * 20, "expires_in": 1800,
+                       "token_type": "Bearer", "refresh_token": "rt-next"}
+            if payload_scope is not None:
+                payload["scope"] = payload_scope
+            return payload
+        return post
+
+    monkeypatch.setattr(auth, "_post_refresh", opaque("offline_access accounting.contacts"))
+    auth.refresh()
+    assert auth.granted_scopes() == {"offline_access", "accounting.contacts"}, "the response field, when present"
+
+    monkeypatch.setattr(auth, "_post_refresh", opaque(None))
+    auth.refresh()
+    assert auth.granted_scopes() is None, "unknown, not empty"
+
+
 def test_an_expired_access_token_is_refreshed_on_401_and_the_call_retried(xero, client_factory):
     """Clocks disagree; the 401 is the truth. One refresh, one retry, no duplicate."""
     client = client_factory(xero)

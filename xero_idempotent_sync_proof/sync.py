@@ -34,7 +34,8 @@ Project         name -- not unique (an      Look first, always, under the
                                             unavailable`` in the ledger and a
                                             notice (assumption: that 403 is
                                             the plan). Without the scope ->
-                                            escalate: the app's fault.
+                                            escalate: the app's fault. Scopes
+                                            unknown -> escalate: cannot tell.
 ==============  ==========================  ==================================
 
 The rule behind the table: where Xero refuses a duplicate loudly, the
@@ -374,10 +375,23 @@ class SyncEngine:
             # A 403 from projects.xro has two causes that look the same on
             # the wire: the token was not granted the ``projects`` scope, or
             # the organisation's plan has no Projects. The first is the app's
-            # mistake and must not be filed as a plan limit: the token
-            # response says which scopes were granted, so check that first.
+            # mistake and must not be filed as a plan limit: the access
+            # token's ``scope`` claim says which scopes were granted, so check
+            # that first -- and when it cannot be read at all, the 403 is
+            # evidence of nothing, and recording ``unavailable`` would bury a
+            # possible authorisation mistake for every deal. Escalate instead.
             scopes = self.client.auth.granted_scopes()
-            if scopes is not None and "projects" not in scopes:
+            if scopes is None:
+                raise UnresolvableStep(
+                    deal.deal_id,
+                    STEP_PROJECT,
+                    f"the Projects API answered HTTP {exc.status}, and the scopes granted to the "
+                    "app's token are unknown (the access token is not a decodable JWT with a "
+                    "scope claim, and the token response carried no scope field). Whether this "
+                    "403 is the organisation's plan or the app's missing 'projects' scope cannot "
+                    "be told, so it is not recorded as unavailable",
+                ) from exc
+            if "projects" not in scopes:
                 raise UnresolvableStep(
                     deal.deal_id,
                     STEP_PROJECT,

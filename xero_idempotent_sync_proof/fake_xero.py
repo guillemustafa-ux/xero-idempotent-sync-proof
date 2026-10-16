@@ -27,8 +27,10 @@ decide whether an integration is exactly-once or merely usually-once:
 * **OAuth refresh rotation**: every refresh returns a new refresh token; the
   previous one keeps working for a **30-minute grace period**, then
   ``invalid_grant``. A refresh token not used for **60 days** is
-  ``invalid_grant`` too. Access tokens live 30 minutes. The token response
-  echoes the granted ``scope``.
+  ``invalid_grant`` too. Access tokens live 30 minutes and are **JWT-shaped**
+  (unsigned here); the granted scopes are the token's ``scope`` claim, an
+  array -- the token response itself carries no ``scope`` field, as
+  documented.
 * **Invoice statuses**: ``DRAFT``/``SUBMITTED``/``AUTHORISED`` on create;
   an ``AUTHORISED`` invoice never goes back to ``DRAFT`` or ``SUBMITTED``;
   ``PAID`` and ``VOIDED`` are final.
@@ -99,7 +101,12 @@ CLIENT_ID = "proof-client-id"
 CLIENT_SECRET = "proof-client-secret"
 TENANT_ID = "7d1a6f7e-0f1c-4a7a-9d7e-2f4e3b1c9a10"
 TENANT_NAME = "Demo Company (proof)"
-SCOPES = "offline_access accounting.contacts accounting.invoices accounting.payments projects"
+# Granular scopes (apps created since 2026-03-02); ``accounting.settings.read``
+# is what ``GET /Organisation`` needs.
+SCOPES = (
+    "offline_access accounting.contacts accounting.invoices accounting.payments "
+    "accounting.settings.read projects"
+)
 
 # The one bank account payments can land in, and the one sales account.
 BANK_ACCOUNT_CODE = "090"
@@ -156,6 +163,11 @@ def _dotnet_date_from_iso(value: Any) -> Any:
     return _dotnet_date(midnight.timestamp())
 
 
+def _b64url(obj: Any) -> str:
+    """base64url without padding, as JWT segments are encoded."""
+    return base64.urlsafe_b64encode(json.dumps(obj, separators=(",", ":")).encode()).rstrip(b"=").decode()
+
+
 def _fingerprint(method: str, path: str, body: bytes) -> str:
     return hashlib.sha256(f"{method} {path}\n".encode() + body).hexdigest()
 
@@ -201,7 +213,7 @@ class XeroState:
     # Documented: a refresh token lives 60 days.
     refresh_token_issued_at: float | None = None
     retired_refresh_tokens: dict[str, float] = field(default_factory=dict)  # token -> retired_at
-    # What the authorisation granted; echoed in every token response.
+    # What the authorisation granted; the ``scope`` claim of every access token.
     granted_scopes: str = SCOPES
     # Faults armed for the next matching request, popped as they fire.
     armed: list[tuple[str, str]] = field(default_factory=list)
@@ -320,8 +332,29 @@ class XeroState:
         return issued is not None and self.now() - issued >= REFRESH_TOKEN_TTL_SECONDS
 
     def issue_access_token(self, client_id: str) -> str:
-        token = "at-" + secrets.token_hex(12)
-        self.access_tokens[token] = (client_id, self.now() + ACCESS_TOKEN_TTL_SECONDS)
+        """A JWT-shaped access token: header.payload.signature, base64url, **unsigned**.
+
+        Documented: the access token is a JWT that "can be decoded to a JSON
+        object", and the token response carries no ``scope`` field. The
+        granted scopes therefore live only in the token's ``scope`` claim, as
+        an array. The signature is random bytes -- the fake looks tokens up
+        by their full text and nobody verifies them. Assumption, not verified
+        against Xero: the claim is named ``scope`` and is an array of strings
+        (the IdentityServer convention Xero's identity service follows).
+        """
+        now = self.now()
+        header = {"alg": "RS256", "typ": "JWT", "kid": "proof"}
+        claims = {
+            "iss": "https://identity.xero.com",
+            "iat": int(now),
+            "exp": int(now + ACCESS_TOKEN_TTL_SECONDS),
+            "client_id": client_id,
+            "jti": str(uuid.uuid4()),
+            "authentication_event_id": str(uuid.uuid4()),
+            "scope": self.granted_scopes.split(),
+        }
+        token = ".".join((_b64url(header), _b64url(claims), secrets.token_urlsafe(32)))
+        self.access_tokens[token] = (client_id, now + ACCESS_TOKEN_TTL_SECONDS)
         return token
 
 
@@ -690,6 +723,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             new_refresh = state.rotate()
             access = state.issue_access_token(CLIENT_ID)
+            # Documented fields only: no ``scope`` here. The granted scopes
+            # are a claim inside the access token (see ``issue_access_token``).
             self._send_json(
                 200,
                 {
@@ -697,7 +732,6 @@ class _Handler(BaseHTTPRequestHandler):
                     "expires_in": ACCESS_TOKEN_TTL_SECONDS,
                     "token_type": "Bearer",
                     "refresh_token": new_refresh,
-                    "scope": state.granted_scopes,
                 },
             )
 
@@ -1082,7 +1116,7 @@ class FakeXero:
             self.state.number_collision_message = message
 
     def grant_scopes(self, scopes: str) -> None:
-        """What the authorisation granted (space-separated), as the token response will echo it."""
+        """What the authorisation granted (space-separated); the next access token's ``scope`` claim."""
         with self.state._lock:
             self.state.granted_scopes = scopes
 

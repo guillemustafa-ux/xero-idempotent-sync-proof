@@ -651,13 +651,30 @@ def test_a_payment_to_an_unknown_bank_account_is_refused_until_the_account_exist
     assert status == 200 and len(xero.payments) == 1
 
 
+def jwt_claims(token: str) -> dict[str, Any]:
+    """The payload of a JWT-shaped token, signature unchecked (the fake does not sign)."""
+    header, payload, _signature = token.split(".")
+    return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+
+
 def test_the_token_carries_the_granted_scopes_and_projects_needs_its_own(xero_factory):
-    """``grant_scopes``: without ``projects`` in the token, projects.xro is 403 whatever the plan."""
+    """``grant_scopes``: without ``projects`` in the token, projects.xro is 403 whatever the plan.
+
+    Documented: the token response carries ``access_token``, ``expires_in``,
+    ``token_type``, ``refresh_token`` (and ``id_token`` with OpenID) -- no
+    ``scope`` field -- and the access token is a JWT that can be decoded. The
+    granted scopes are a claim inside it (``scope``, an array), which is the
+    only place the fake puts them.
+    """
     xero = xero_factory(projects_available=True)
     xero.grant_scopes("offline_access accounting.contacts accounting.invoices accounting.payments")
     status, body, _ = refresh(xero, xero.refresh_token)
-    assert status == 200 and "projects" not in body["scope"].split()
+    assert status == 200 and "scope" not in body, "the documented response has no scope field"
+    assert set(body) == {"access_token", "expires_in", "token_type", "refresh_token"}
     token = body["access_token"]
+    claims = jwt_claims(token)
+    assert claims["scope"] == ["offline_access", "accounting.contacts", "accounting.invoices", "accounting.payments"]
+    assert claims["exp"] > claims["iat"] and claims["client_id"] == CLIENT_ID
     status, body, _ = call(xero, "GET", "/projects.xro/2.0/Projects", token=token)
     assert status == 403 and "scope" in json.dumps(body)
     status, _, _ = call(xero, "GET", "/api.xro/2.0/Organisation", token=token)

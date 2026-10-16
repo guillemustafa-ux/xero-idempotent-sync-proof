@@ -26,6 +26,7 @@ one store, so the limit is stated, not exercised.
 from __future__ import annotations
 
 import base64
+import binascii
 import http.client
 import json
 import sqlite3
@@ -64,9 +65,50 @@ class Tokens:
     access_expires_at: float
     refresh_token: str
     refresh_expires_at: float
-    # The space-separated scopes the token response said were granted; None
-    # until the first refresh has been seen.
+    # The space-separated scopes the current access token was granted, read
+    # from its JWT ``scope`` claim (or, failing that, from a ``scope`` field
+    # in the token response, which the docs do not list). None when neither
+    # could be read: "unknown", which is not "none granted".
     scope: str | None = None
+
+
+def jwt_claims(token: str | None) -> dict | None:
+    """The payload of a JWT-shaped token, **unverified**; ``None`` for anything else.
+
+    The access token is documented as a JWT that can be decoded. Decoding is
+    not verifying: nothing here checks the signature, and nothing security-
+    relevant is decided on these claims -- only which scopes the app should
+    expect to work, so a 403 can be told apart from a plan limit.
+    """
+    if not token or token.count(".") != 2:
+        return None
+    _header, payload, _signature = token.split(".")
+    try:
+        raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+        claims = json.loads(raw)
+    except (ValueError, binascii.Error):
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
+def granted_scope_string(payload: dict, access_token: str) -> str | None:
+    """The granted scopes, space-separated, or ``None`` when they cannot be read.
+
+    Order of trust: the access token's ``scope`` claim (array or string),
+    then a ``scope`` field in the token response if one is present, else
+    ``None``. Assumption, not verified against Xero: the claim is named
+    ``scope`` and is an array of strings.
+    """
+    claims = jwt_claims(access_token) or {}
+    scope = claims.get("scope")
+    if isinstance(scope, list) and scope:
+        return " ".join(str(s) for s in scope)
+    if isinstance(scope, str) and scope.strip():
+        return scope.strip()
+    field = payload.get("scope")
+    if isinstance(field, str) and field.strip():
+        return field.strip()
+    return None
 
 
 class TokenStore:
@@ -159,11 +201,14 @@ class Authenticator:
         return tokens.access_token
 
     def granted_scopes(self) -> set[str] | None:
-        """The scopes the last token response said were granted; ``None`` if never seen.
+        """The scopes the current access token was granted; ``None`` when unknown.
 
-        A 403 from an API that needs a scope the app was not granted looks
-        exactly like a 403 from a plan that lacks the product. This is how
-        the sync tells them apart.
+        Read from the token's JWT ``scope`` claim at refresh time (the token
+        response has no ``scope`` field in the docs). A 403 from an API that
+        needs a scope the app was not granted looks exactly like a 403 from
+        a plan that lacks the product; this is how the sync tells them apart
+        -- and ``None`` means it cannot, which the sync treats as a reason to
+        escalate, never as "nothing granted".
         """
         tokens = self.store.load()
         if tokens is None or tokens.scope is None:
@@ -187,7 +232,7 @@ class Authenticator:
             access_expires_at=issued_at + float(payload.get("expires_in", ACCESS_TOKEN_LIFETIME)),
             refresh_token=payload["refresh_token"],
             refresh_expires_at=issued_at + REFRESH_TOKEN_LIFETIME,
-            scope=payload.get("scope") or current.scope,
+            scope=granted_scope_string(payload, payload["access_token"]),
         )
         self.store.save(tokens)
         return tokens
