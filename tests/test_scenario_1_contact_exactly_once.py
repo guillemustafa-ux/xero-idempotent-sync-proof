@@ -338,6 +338,30 @@ def test_a_rebuilt_ledger_re_derives_every_key_and_number_and_creates_nothing(
     assert len(idempotency_key_for(webhook["deal_id"], "payment", "pay-1")) <= IDEMPOTENCY_KEY_MAX_LEN
 
 
+def test_a_number_collision_is_settled_by_the_lookup_whatever_the_message_says(
+    xero, engine_factory, make_webhook
+):
+    """The wording of the duplicate-ContactNumber refusal is not documented.
+
+    The docs say only that a PUT matching an existing ``ContactNumber`` "will
+    receive an error". So the sync must not key on message text for the
+    number: on **any** 400 from the create it asks ``GET /Contacts/
+    {ContactNumber}`` first. Here the holder has a different name (so the
+    name is free) and the fake answers the number collision with a generic
+    validation message -- and the sync still adopts.
+    """
+    planted = xero.plant_contact("A. Perez & T. Ruiz (old import)", contact_number_for("deal-1001"))
+    xero.answer_number_collisions_with("A validation exception occurred")
+
+    deal = engine_factory(xero).apply(make_webhook())
+
+    assert deal.xero_contact_id == planted["ContactID"], "ours by number, whatever the text"
+    assert deal.xero_contact_name == "A. Perez & T. Ruiz (old import)"
+    assert len(xero.contacts) == 1 and deal.sync_status == SYNC_SYNCED
+    assert len(contact_puts(xero)) == 1, "one refused create, then the lookup; no variant was tried"
+    assert len(lookups_by_number(xero, contact_number_for("deal-1001"))) == 1
+
+
 def test_a_holder_carrying_our_contact_number_is_adopted_not_suffixed(
     xero, engine_factory, make_webhook
 ):

@@ -303,7 +303,14 @@ def test_contact_number_must_be_unique_and_is_a_lookup_key(xero, token):
 
     status, body, _ = call(xero, "PUT", "/api.xro/2.0/Contacts", token=token, body=contact("Bea", "hs-1"))
     assert status == 400
+    # Assumption, not verified against Xero: the docs say only that a PUT
+    # matching an existing ContactNumber "will receive an error". The wording
+    # below is the fake's own, and is switchable so the sync can be shown not
+    # to depend on it.
     assert "The contact number hs-1 is already assigned to another contact." in messages(body)
+    xero.answer_number_collisions_with("A validation exception occurred")
+    status, body, _ = call(xero, "PUT", "/api.xro/2.0/Contacts", token=token, body=contact("Bea", "hs-1"))
+    assert status == 400 and messages(body) == ["A validation exception occurred"] * 2
 
     status, body, _ = call(xero, "GET", "/api.xro/2.0/Contacts/hs-1", token=token)
     assert status == 200 and body["Contacts"][0]["ContactID"] == contact_id

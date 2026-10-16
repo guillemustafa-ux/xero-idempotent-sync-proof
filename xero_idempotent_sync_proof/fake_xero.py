@@ -11,9 +11,11 @@ decide whether an integration is exactly-once or merely usually-once:
   The clock is injectable, so a test can watch the window close.
 * **Contact ``Name`` unique across active contacts** and **``ContactNumber``
   unique** (API-only, max 50, readable with ``GET /Contacts/{ContactNumber}``),
-  both answered with ``400`` and the verbatim messages from the official
-  OpenAPI examples. ``where=Name=="..."`` is case-insensitive;
-  ``includeArchived=true`` shows archived rows.
+  both answered with ``400``. The Name message is verbatim from the official
+  OpenAPI examples; the ContactNumber message is **not documented** (the docs
+  say only that the PUT "will receive an error") and is switchable, so the
+  sync can be shown not to depend on its wording. ``where=Name=="..."`` is
+  case-insensitive; ``includeArchived=true`` shows archived rows.
 * **ACCREC ``InvoiceNumber`` unique** ("Invoice # must be unique.");
   payments only on an ``AUTHORISED`` invoice, never above ``AmountDue``, and
   the payment ``Reference`` is **not** unique -- the invoice's ``Payments[]``
@@ -38,6 +40,8 @@ not verified against Xero:
 
 * an **archived** contact keeps its ``Name`` reserved (the message says
   "active contacts"; the harder reading is modelled);
+* the wording of the duplicate-``ContactNumber`` 400 (default: the Name
+  message's shape; see ``answer_number_collisions_with``);
 * a quote inside a ``where`` string literal is escaped as ``\\"``;
 * ``Idempotency-Key`` is honoured on the Projects API as on Accounting;
 * the exact bodies of the 401, 403, 404 and 429 responses, which the client
@@ -147,6 +151,8 @@ class XeroState:
     armed: list[tuple[str, str]] = field(default_factory=list)
     throttle_remaining: int = 0
     retry_after: int = 3
+    # None -> the default wording (an assumption; the docs give none).
+    number_collision_message: str | None = None
     minute_remaining: int = MINUTE_LIMIT
     day_remaining: int = DAY_LIMIT
 
@@ -628,8 +634,12 @@ class _Handler(BaseHTTPRequestHandler):
                 f"The contact name {name} is already assigned to another contact. "
                 "The contact name must be unique across all active contacts.", item))
         if number is not None and state.contact_by_number(str(number)) is not None:
-            return _Reply(400, self._validation(
-                f"The contact number {number} is already assigned to another contact.", item))
+            # Assumption, not verified against Xero: the docs say only that
+            # the PUT "will receive an error". A client must not key on this.
+            message = state.number_collision_message or (
+                f"The contact number {number} is already assigned to another contact."
+            )
+            return _Reply(400, self._validation(message, item))
 
         fault = state.take_fault(ROUTE_CONTACT)
         if fault == FAULT_BEFORE_COMMIT:
@@ -909,6 +919,11 @@ class FakeXero:
         with self.state._lock:
             self.state.throttle_remaining = n
             self.state.retry_after = retry_after
+
+    def answer_number_collisions_with(self, message: str) -> None:
+        """Change the (undocumented) wording of the duplicate-ContactNumber 400."""
+        with self.state._lock:
+            self.state.number_collision_message = message
 
     def set_projects_available(self, available: bool) -> None:
         with self.state._lock:

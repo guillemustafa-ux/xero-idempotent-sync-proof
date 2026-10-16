@@ -81,9 +81,11 @@ MAX_NAME_VARIANTS = 2
 SALES_ACCOUNT_CODE = "200"
 BANK_ACCOUNT_CODE = "090"
 
-# Xero's refusals, by the fragment the sync keys on. Both the taken-Name and
-# the taken-ContactNumber messages contain the first one.
-ALREADY_ASSIGNED = "is already assigned to another contact"
+# Xero's refusals, by the fragment the sync keys on. Both are verbatim from
+# the official OpenAPI examples. The duplicate-ContactNumber refusal has no
+# documented wording, so the sync never keys on it: any 400 from the contact
+# create is followed by the lookup by number.
+CONTACT_NAME_TAKEN = "The contact name must be unique across all active contacts."
 INVOICE_NUMBER_TAKEN = "Invoice # must be unique."
 
 
@@ -219,16 +221,18 @@ class SyncEngine:
         """Create (or replay) the contact under its derived key.
 
         Returns the contact, or ``None`` when the name is held by a stranger.
-        The "already assigned" ``400`` is a definite answer, so it is safe to
-        act on -- but it is not, on its own, proof that the holder is not
-        ours: the planted ``ContactNumber`` settles that.
+        A ``400`` is a definite answer -- nothing was created -- but its text
+        is not what settles the step: whatever the message, the first question
+        is whether a contact already carries our ``ContactNumber``. Only the
+        Name refusal has documented wording; the ContactNumber refusal does
+        not ("you will receive an error"), so it is never matched on.
         """
         try:
             created = self.client.create_contact(
                 {"Name": name, "ContactNumber": number}, idempotency_key=intent.idempotency_key
             )
         except XeroRejected as exc:
-            if not exc.says(ALREADY_ASSIGNED):
+            if exc.status != 400:
                 raise
             ours = self._ours_by_number(number)
             if ours is not None:
@@ -240,7 +244,9 @@ class SyncEngine:
                     ours["ContactID"],
                 )
                 return ours
-            return None
+            if exc.says(CONTACT_NAME_TAKEN):
+                return None  # a stranger holds the name; our number never landed
+            raise  # a real validation error: nothing to adopt, nothing to rename
         self._log_verdict(intent, created, "ContactID")
         return created.entity
 
@@ -526,7 +532,7 @@ def naive_contact_sync(ledger: Ledger, client: XeroClient, deal_id: str) -> dict
         try:
             created = client.create_contact({"Name": name}, idempotency_key=str(uuid.uuid4()))
         except XeroRejected as exc:
-            if not exc.says(ALREADY_ASSIGNED):
+            if not exc.says(CONTACT_NAME_TAKEN):
                 raise
             name = f"{base} ({attempt + 1})"
             continue
@@ -554,7 +560,7 @@ def naive_contact_sync_trusting_the_key(
                 {"Name": name}, idempotency_key=idempotency_key_for(deal_id, STEP_CONTACT, name)
             )
         except XeroRejected as exc:
-            if not exc.says(ALREADY_ASSIGNED):
+            if not exc.says(CONTACT_NAME_TAKEN):
                 raise
             name = f"{base} ({attempt + 1})"
             continue
