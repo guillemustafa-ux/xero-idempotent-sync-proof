@@ -100,19 +100,34 @@ unique does.
   and the settled name variant, the attempt counter and the project mode,
   so a later process derives the right name and the right key without
   re-provoking the 400s that taught the first one. The planted keys and the
-  look-first rule are what prevent the duplicate; the derived key is what
-  settles two replicas racing.
+  look-first rule are what prevent the duplicate, not the row.
+* **Two replicas racing are settled step by step, and the guarantee
+  differs.** Separate ledgers, the same delivery, both past the lookup:
+  the **contact and invoice** are settled by the planted unique
+  `ContactNumber` / `InvoiceNumber` -- the second send is refused and
+  adopts the first, whatever key it carried. The **payment and project**
+  are settled by the **one derived key**, inside the six-minute window, and
+  by nothing after it. What this design does not close: replica A sends at
+  minute 0, replica B looks up at 6:01 before A's payment is visible and
+  sends -- a window of seconds against an immediate lookup, and nothing
+  Xero offers closes it.
 * **The key is derived, not generated.**
   `"xis-" + sha256(f"{deal_id}:{step}[:{ref}]")[:40]` -- 44 characters,
   under Xero's limit of 128 -- so any process, at any later time, with no
   memory of the attempt, computes the same one. `uuid4()` at call time is
   not an idempotency key: every retry carries a fresh one and Xero has
-  nothing to recognise. One rule on top: a **validation `400` is cached
-  under its key for six minutes**, so after a provable rejection the step's
-  persisted `attempt` is bumped and the next send derives
-  `...:attempt{n}` -- a key Xero has never seen. Nothing was created under
-  the old key, so nothing can be doubled; attempt 0 stays exactly what a
-  rebuilt ledger re-derives.
+  nothing to recognise. One rule on top, and it is **not the same for every
+  step**: a **validation `400` is cached under its key for six minutes**.
+  For the contact and invoice -- where Xero refuses a duplicate on the
+  planted number anyway -- a provable rejection bumps the step's persisted
+  `attempt` and the next send derives `...:attempt{n}`, a key Xero has
+  never seen; a second replica on another attempt is refused on the number
+  and adopts. For the **payment and project the key is never changed**: a
+  per-ledger counter in the key would make two replicas send two keys for
+  one instalment and book it twice (scenario 4p). A cached 400 pins those
+  steps for at most six minutes instead, with the reason on the deal row;
+  the send after the window goes out under the same key and is processed
+  as new. Attempt 0 stays exactly what a rebuilt ledger re-derives.
 * **The planted keys are derived the same way.** `ContactNumber`
   `hs-deal-{deal_id}` (hashed when over Xero's 50 characters),
   `InvoiceNumber` `HS-{deal_id}`, payment `Reference`
@@ -143,22 +158,41 @@ unique does.
   store, or serialise rotation.
 * **429 means resend the same request -- within the window.** A throttled
   create is retried after the `Retry-After` Xero asked for, with the same
-  URL, body and key. If honouring the next `Retry-After` would carry the
-  accumulated wait past six minutes, the resend would be processed as new,
-  so the transport stops and raises `UnknownOutcome` instead; the sync then
-  looks up before it sends.
-* **A 5xx, or any answer that is not a Xero JSON body, is `UnknownOutcome`**,
-  not a rejection. A gateway can answer 502 after handing the request on.
-* **A Projects `403` is checked against the granted scopes** (the token
-  response echoes them) before it is read as "the plan has no Projects". A
-  token missing the `projects` scope is the app's mistake, escalated, never
-  filed as a plan limit.
+  URL, body and key. The 429s themselves put nothing in Xero; the hazard is
+  an *earlier* send under the same key (a lost response, a killed process)
+  whose six minutes the accumulated wait does not measure and may outlive
+  -- a resend after it closes is processed as new. So if honouring the next
+  `Retry-After` would cross six minutes the transport stops with
+  `ThrottledPastWindow` (an `UnknownOutcome`) and the sync looks up before
+  it sends.
+* **The status code is read before the body.** A 401 refreshes once; a 404
+  is "absent" -- Xero's 404 is commonly **plain text**, and a client that
+  demanded a JSON body first would never learn that the planted number is
+  free; a 429 is throttling; a Projects 403 is the product gate. Only the
+  remaining 4xx (the 400 whose messages the sync reads) must carry a Xero
+  JSON body to count as a definite "no". **A 5xx, or a 400-class answer
+  with no Xero body, is `UnknownOutcome`**, not a rejection: a gateway can
+  answer 502 after handing the request on.
+* **A Projects `403` is checked against the granted scopes** before it is
+  read as "the plan has no Projects". The scopes are a claim inside the
+  access-token JWT (the token response has no `scope` field in the docs);
+  a token missing the `projects` scope is the app's mistake, escalated,
+  never filed as a plan limit -- and when the scopes cannot be read at
+  all, the 403 is escalated too, because it is then evidence of nothing.
 * **Unique indexes on every remote binding** -- `xero_contact_id`,
   `xero_project_id`, `xero_invoice_id`, `xero_payment_id` -- and a `CHECK`
   tying `xero_project_id` to `project_mode` (an id exists exactly when the
   mode says a real Project was made), so a future change that lies about a
   project or binds a second Xero entity to one local thing is rejected by
-  the database rather than by a code review.
+  the database rather than by a code review. A `schema_version` table
+  upgrades a database written by an earlier version on open (`ALTER TABLE
+  ... ADD COLUMN`), because `CREATE TABLE IF NOT EXISTS` does nothing to a
+  table that already exists.
+* **Recovery walks every deal, whatever blew up.** One deal's escalation,
+  rejection, unknown outcome -- or an exception nobody wrote a handler for
+  -- is recorded on that deal's row and the walk continues; only an
+  authentication lockout stops it, because every deal behind would fail
+  the same way.
 
 ## Verify it in two minutes
 
@@ -226,7 +260,7 @@ tests/test_scenario_4_payments_and_ledger.py
   resolve deal-1001 step=payment[pay-1] key=xis-e5724cf0…4ee55 -> REPLAYED (PaymentID=95414622…a4adc4)
   test_two_workers_past_the_lookup_at_the_same_moment_book_one_payment PASSED
 
-84 passed
+102 passed
 ```
 
 Note the verdicts: **ADOPT**, **PROVEN ABSENT**, **CREATED NOW**,
@@ -237,7 +271,8 @@ killed child is what makes it ask. In the rebuilt-ledger test there is no
 row and no key, so the resend goes out, is refused on the name, and the
 refusal is answered by the lookup. In the two-workers test the lookup
 cannot help -- both replicas saw nothing -- and only the key both of them
-*derived* makes the second send a replay. (The verdict word `REPLAYED` comes
+*derived* makes the second send a replay; which is why that key is never
+changed for a payment, not even after a cached 400. (The verdict word `REPLAYED` comes
 from a response header the *fake* adds on a replay; the real service
 returns the identical body with no marker. Nothing in the sync decides
 anything based on it. It exists so the log can tell you what happened.)
@@ -258,22 +293,30 @@ anything based on it. It exists so the log can tell you what happened.)
 | 1j | `test_a_rebuilt_ledger_re_derives_every_key_and_number_and_creates_nothing[after-the-window]` | ledger wiped, window closed | no key left to replay; the resend is refused on the name and the refusal triggers the lookup by number; nothing is created |
 | 1k | `test_a_number_collision_is_settled_by_the_lookup_whatever_the_message_says` | -- | the duplicate-`ContactNumber` wording is undocumented, so **any** `400` from the create is followed by the lookup by number; a holder with a different name and a generic message is still adopted |
 | 1l | `test_a_holder_carrying_our_contact_number_is_adopted_not_suffixed` | -- | "already assigned" is not proof of a stranger: the holder carries our number, so it is adopted, not given a date suffix |
+| 1m | `test_a_plain_text_404_still_proves_the_number_absent` | a stranger holds the name; the lookup by number is a `404` with a **plain-text** body | the status is the answer: `None`, the date variant is created; a client demanding a JSON body first would have left this deal "unknown" forever |
 | 2a | `test_an_organisation_without_projects_is_flagged_and_still_invoiced` | Projects answers `403` | no project is created, the ledger says `unavailable`, a notice is surfaced, and the invoice and payment are still booked on the contact |
 | 2b | `test_a_403_with_the_projects_scope_missing_is_the_apps_fault_not_the_plans` | `403`, token without the `projects` scope | escalated with the granted scopes named; **not** recorded as `unavailable`; nothing downstream until a human re-authorises |
+| 2b' | `test_a_403_with_the_granted_scopes_unknown_is_escalated_not_filed_as_the_plan` | `403`, and the scopes cannot be read (no decodable JWT, no `scope` field) | escalated: a 403 whose cause cannot be told is not evidence about the plan; never `unavailable` |
 | 2c | `test_an_organisation_with_projects_gets_a_real_project` | -- | the same code on a plan with Projects creates a real project and records `projects_api` |
 | 2d | `test_crash_between_create_project_and_persist_adopts_by_planted_name` | `os._exit` after the POST returns; recovery after the window | no key to replay and no unique name to collide on; the lookup by planted name finds exactly one and adopts it; one POST on the wire |
 | 2e | `test_two_projects_with_the_same_planted_name_escalate_instead_of_guessing` | same, plus a second project planted | the sync stops with both ids, books nothing downstream, and still two projects, not three; startup recovery reports it instead of raising |
 | 2f | `test_recovery_settles_the_deals_it_can_and_reports_the_one_it_cannot` | deal A unresolvable, deal B killed after its payment landed | recovery walks both: A is reported with its reason, B's payment is adopted, not resent |
+| 2f' | `test_recovery_records_an_unexpected_exception_on_its_deal_and_walks_on` | deal A blows up on an exception with no handler | recorded as `RuntimeError: ...` on A's row, B settled; an authentication lockout, by contrast, propagates |
 | 2g | `test_recovery_finds_the_planted_project_behind_hundreds_of_others` | 520 other projects under the contact; crash; window closed | the list is paged (50 by default, 500 at most): `pageSize=500`, `contactID` filter, every page `pagination.pageCount` announces; adopted from page 2 |
 | 2h | `test_the_lookup_matches_the_planted_name_exactly_and_ignores_the_contacts_other_projects` | -- | the contact's other projects, a near-miss name and a stranger's project with our exact name are all left alone |
 | 2i | `test_a_lost_response_on_the_project_create_is_settled_by_the_name_lookup` | connection cut after Xero commits | one POST, ever; the name lookup adopts before the key has to replay |
+| 2j | `test_the_projects_lookup_spells_the_documented_contactID_on_the_wire` | -- | every list request carried `contactID` (the documented spelling) and `pageSize=500`, pinned on the fake's wire, because a wrong spelling would be hidden by the client's own filter |
+| 2k | `test_the_projects_lookup_filters_by_contact_itself_when_the_service_does_not` | the fake ignores `contactID` and returns every project | a stranger's project with our exact name is on the page and is not matched; reverting either guard alone fails exactly one of 2j/2k |
 | 3a | `test_refresh_rotation_persists_the_latest_token_for_a_fresh_process` | -- | after a rotation and past the grace period, a brand-new process authenticates from the store alone |
 | 3b | `test_a_store_that_kept_the_old_refresh_token_still_works_inside_the_grace_period` | -- | **the anti-pattern, caught in time**: 29 minutes after dropping the rotated token the stale store still refreshes, and a correct refresh repairs it |
 | 3c | `test_a_store_that_kept_the_old_refresh_token_is_locked_out_after_the_grace_period` | -- | **the anti-pattern, 31 minutes later**: `invalid_grant` for good; only a human re-authorisation fixes it |
+| 3c' | `test_granted_scopes_are_read_from_the_access_token_jwt_not_from_the_response` | -- | the scopes come from the access token's `scope` claim; an opaque token with a `scope` field in the response still works; an opaque token and nothing else -> `None`, "unknown", never an empty set |
+| 3c'' | `test_a_token_store_from_before_the_scope_column_is_upgraded_on_open` | an `oauth_tokens` table without `scope` | opened, upgraded, the next refresh writes and reads the column |
 | 3d | `test_an_expired_access_token_is_refreshed_on_401_and_the_call_retried` | access token revoked behind the client | one refresh, one retry, one contact |
 | 3e | `test_a_throttled_create_resends_the_same_key_and_makes_one_contact` | two `429` in a row | `Retry-After` honoured once per 429; every send carried the same key; one contact |
 | 3f | `test_a_5xx_is_an_unknown_outcome_not_a_rejection` | `503` on the create | `UnknownOutcome`, not `XeroRejected`; recorded on the deal; the next run looks up by the planted number before it sends |
-| 3g | `test_throttling_that_would_outlast_the_key_window_stops_and_asks` | two `429` with `Retry-After: 200` | the first wait fits, the second would cross 360 s; the transport stops with `UnknownOutcome` and the sync looks up first |
+| 3f' | `test_a_400_without_a_xero_body_is_unknown_and_a_plain_404_is_absent` | a `400` with a gateway's HTML body; a `404` with a plain-text body | the first is `UnknownOutcome` (not written by Xero); the second is `None` from the lookup, never "unknown" |
+| 3g | `test_throttling_that_would_outlast_the_key_window_stops_and_asks` | two `429` with `Retry-After: 200` | the first wait fits, the second would cross 360 s; the transport stops with `ThrottledPastWindow` -- for the sake of an *earlier* send under the key, not this one -- and the sync looks up first |
 | 4a | `test_duplicate_webhook_delivery_records_one_payment` | -- | the same webhook twice, from two workers: one Payment, balance read back |
 | 4b | `test_two_workers_past_the_lookup_at_the_same_moment_book_one_payment` | a second replica with its own database sends at the `before_payment_send` seam | **what the six-minute key is for**: both looked up and saw nothing; only the key both derived makes the second send a replay; one Payment, both ledgers bound to it |
 | 4c | `test_a_second_payment_hits_the_same_contact_and_invoice` | -- | later instalments reuse everything and add one Payment; `amount_owed` comes from the invoice |
@@ -284,17 +327,22 @@ anything based on it. It exists so the log can tell you what happened.)
 | 4h | `test_an_invoice_with_our_number_on_a_strangers_contact_is_escalated` | -- | "Invoice # must be unique." says *an* invoice exists, not whose; one on another contact is named with both contact ids and nothing is paid against it |
 | 4i | `test_a_payment_survives_a_real_kill_between_200_and_persist` | `os._exit` after the payment 200 | recovery counts the invoice's `Payments[]` carrying our `Reference`, finds one, adopts; no resend |
 | 4j | `test_two_payments_with_our_reference_escalate_instead_of_guessing` | same, plus a second payment planted with our reference | the sync stops with both ids, adopts nothing, resends nothing; recovery reports it |
-| 4k | `test_a_cached_rejection_does_not_pin_the_payment_for_six_minutes` | the bank account is missing, so the payment is a real `400` | **the second trap of the key store**: Xero caches errors too; the attempt is bumped and the fix takes effect on the next send under a fresh derived key, with the clock not moved at all |
+| 4k | `test_a_cached_rejection_pins_the_payment_for_at_most_six_minutes` | the bank account is missing, so the payment is a real `400` | **the second trap of the key store**: Xero caches errors too, and the sync does *not* mint a fresh key to dodge it -- the deal records the rejection, the step stays pinned on the cached 400 for at most the window, and the send after it goes out under the same key, once |
 | 4l | `test_a_strangers_payment_carrying_our_reference_is_not_adopted` | -- | one match is not proof: a 1.00 test payment quoting our reference, or the right amount on the wrong day, is escalated, never adopted |
+| 4l' | `test_a_payment_whose_date_cannot_be_read_is_a_mismatch_not_a_pass` | the one match has the right amount and a date nobody can parse | a mismatch, not a check skipped: escalated with the raw date, nothing adopted, nothing sent |
+| 4l'' | `test_a_bound_invoice_that_cannot_be_read_back_is_escalated_not_crashed` | the ledger has the invoice id, Xero answers `404` | `UnresolvableStep` with the ids on that deal's row; the deal behind it is still settled (before: an `AssertionError` that aborted the walk) |
+| 4l''' | `test_xero_dates_are_read_including_negative_epochs` | -- | `/Date(ms+0000)/` is read as epoch + milliseconds, so .NET's `DateTime.MinValue` (`-62135596800000`) is a date and not the `OSError` Windows raises from `fromtimestamp` |
 | 4m | `test_the_schema_refuses_a_second_binding` | -- | the database rejects a second contact, project, invoice or payment binding independently of the code |
 | 4n | `test_apply_is_safe_to_call_repeatedly` | -- | idempotence is a property of the operation, not of a retry budget |
 | 4o | `test_a_rebuilt_ledger_after_the_window_adopts_the_invoice_by_number_and_the_payment_by_reference` | ledger gone **and** window closed | **the strong claim, which QBO could not make**: no key replays anything, and every step still settles by its planted value; nothing is created, and the payment is never resent |
+| 4p | `test_two_replicas_with_unequal_rejection_counts_still_book_one_payment` | two replicas with their own databases hit the cached `400` -- the primary twice, the replica once; account fixed; window closed; seam race | **why the payment's key is never bumped**: with a per-ledger attempt in the key the two would send two keys and book the instalment twice (the reviewer's reproduction: PUT keys `key0, key1, key1, key2`, two payments); with one derived key the race ends in a replay, one payment, both ledgers bound to it |
 
 The remaining tests are the fake's own (27 in `tests/test_fake_xero.py`,
 over raw HTTP, pinning the verbatim error messages, the six-minute expiry,
-the cached error, the different-request `400`, the grace period and the
-paging), the ledger's (11), the crash child's (2) and the live smoke's skip
-path (1).
+the cached error, the different-request `400`, the plain-text `404`, the
+JWT-shaped token, the grace period and the paging), the ledger's (12,
+including the upgrade of a version-1 file), the crash child's (2) and the
+live smoke's skip path (1).
 
 ## Proof that the suite bites
 
@@ -314,13 +362,13 @@ verifies the tree is clean again:
 baseline: PASS
 
 [random-idempotency-key]
-  defect: Generate the Idempotency-Key at call time instead of deriving it from the deal
-          and the step, so a process with no memory of the first attempt -- or a second
-          replica -- sends a key Xero has never seen.
-  how it is caught: A visible duplicate: two replicas past the lookup both send, and the
-          second is no longer a replay (scenario 4), plus the keys asserted on the wire in
-          scenarios 1 and 3.
-  caught by: test_a_cached_rejection_does_not_pin_the_payment_for_six_minutes
+  defect: Generate the Idempotency-Key at call time instead of deriving it from the deal and
+          the step, so a process with no memory of the first attempt -- or a second replica --
+          sends a key Xero has never seen.
+  how it is caught: A visible duplicate: two replicas past the lookup both send, and the second is no
+          longer a replay (scenario 4), plus the keys asserted on the wire in scenarios 1 and
+          3.
+  caught by: test_a_cached_rejection_pins_the_payment_for_at_most_six_minutes
   caught by: test_a_rebuilt_ledger_re_derives_every_key_and_number_and_creates_nothing[inside-the-window]
   caught by: test_a_rejected_step_derives_a_fresh_key_from_its_attempt
   caught by: test_after_the_window_the_key_is_new_and_only_the_contact_number_settles_it
@@ -328,21 +376,25 @@ baseline: PASS
   caught by: test_replaying_a_key_with_a_corrected_body_is_rejected_loudly
   caught by: test_the_idempotency_key_is_derived_not_generated
   caught by: test_two_deals_with_the_same_names_stay_two_contacts
+  caught by: test_two_replicas_with_unequal_rejection_counts_still_book_one_payment
   caught by: test_two_workers_past_the_lookup_at_the_same_moment_book_one_payment
 
 [no-durable-intent]
-  defect: Send the step without recording the intent first, so a process killed mid-call
-          wakes up believing nothing was ever tried.
-  how it is caught: NOT a visible duplicate. With the external keys planted, recovery
-          without the row resends, Xero refuses on the planted ContactNumber or
-          InvoiceNumber, and the refusal triggers the same lookup -- one entity either way.
-          What the suite catches is the blind resend itself: request counts on the fake's
-          wire (one PUT, ever, in the crash tests of scenarios 1 and 4) and the intent row
-          the crash tests read back. The row buys the lookup-before-resend, the settled
-          name variant, the attempt and the project mode; it is not what prevents the
-          duplicate here.
+  defect: Send the step without recording the intent first, so a process killed mid-call wakes
+          up believing nothing was ever tried.
+  how it is caught: NOT a visible duplicate. With the external keys planted, recovery without the row
+          resends, Xero refuses on the planted ContactNumber or InvoiceNumber, and the refusal
+          triggers the same lookup -- one entity either way. What fires, honestly: the crash
+          tests of scenarios 1, 2 and 4 fail on their FIRST assertion, that the killed child
+          left an intent row (their wire counts never run); the ledger tests fail on the
+          missing row; and the wire checks that do fire are scenario 3's 5xx and throttle-
+          past-the-window tests, where the next run must look up by ContactNumber before it
+          resends. The payment crash test's PUT count could not catch this on its own:
+          payments look first anyway. The row buys the lookup-before-resend, the settled name
+          variant, the attempt and the project mode; it is not what prevents the duplicate
+          here.
   caught by: test_a_5xx_is_an_unknown_outcome_not_a_rejection
-  caught by: test_a_cached_rejection_does_not_pin_the_payment_for_six_minutes
+  caught by: test_a_cached_rejection_pins_the_payment_for_at_most_six_minutes
   caught by: test_a_payment_survives_a_real_kill_between_200_and_persist
   caught by: test_a_rejected_step_derives_a_fresh_key_from_its_attempt
   caught by: test_an_invoice_survives_a_real_kill_between_200_and_persist
@@ -355,49 +407,51 @@ baseline: PASS
   caught by: test_two_deals_with_the_same_names_stay_two_contacts
 
 [blind-retry-on-doubt]
-  defect: Resolve an unknown project outcome by assuming it never landed -- the
-          instinctive fix, and the one that doubles the project, because a project name
-          is not unique and the key is gone after six minutes.
+  defect: Resolve an unknown project outcome by assuming it never landed -- the instinctive
+          fix, and the one that doubles the project, because a project name is not unique and
+          the key is gone after six minutes.
   caught by: test_a_rebuilt_ledger_re_derives_every_key_and_number_and_creates_nothing[inside-the-window]
   caught by: test_crash_between_create_project_and_persist_adopts_by_planted_name
   caught by: test_recovery_finds_the_planted_project_behind_hundreds_of_others
   caught by: test_recovery_settles_the_deals_it_can_and_reports_the_one_it_cannot
   caught by: test_the_lookup_matches_the_planted_name_exactly_and_ignores_the_contacts_other_projects
+  caught by: test_the_projects_lookup_filters_by_contact_itself_when_the_service_does_not
   caught by: test_two_projects_with_the_same_planted_name_escalate_instead_of_guessing
 
 [silent-project-fallback]
-  defect: When the Projects API answers 403, record the deal as if a real project had
-          been created, so the business reads 'project' where there is none.
+  defect: When the Projects API answers 403, record the deal as if a real project had been
+          created, so the business reads 'project' where there is none.
   caught by: test_an_organisation_without_projects_is_flagged_and_still_invoiced
   caught by: test_durable_sync_survives_a_real_kill_between_200_and_persist
   caught by: test_a_rebuilt_ledger_after_the_window_adopts_the_invoice_by_number_and_the_payment_by_reference
   caught by: test_two_workers_past_the_lookup_at_the_same_moment_book_one_payment
-  … 27 tests in all: every test whose deal meets the 403 (see the note below)
+  … 32 tests in all: every test whose deal meets the 403 (see the note below)
 
 [stale-refresh-token]
-  defect: After a refresh, keep the stored refresh token instead of the one that came
-          back, so the app is locked out once the 30-minute grace period ends.
+  defect: After a refresh, keep the stored refresh token instead of the one that came back, so
+          the app is locked out once the 30-minute grace period ends.
   caught by: test_a_store_that_kept_the_old_refresh_token_still_works_inside_the_grace_period
   caught by: test_refresh_rotation_persists_the_latest_token_for_a_fresh_process
 
 [increment-amount-paid]
-  defect: Compute amount_paid by adding the recorded payments to the previous total
-          instead of reading AmountPaid/AmountDue back from the invoice, so every
-          redelivered webhook or repeated apply drifts the balance.
+  defect: Compute amount_paid by adding the recorded payments to the previous total instead of
+          reading AmountPaid/AmountDue back from the invoice, so every redelivered webhook or
+          repeated apply drifts the balance.
   caught by: test_a_second_payment_hits_the_same_contact_and_invoice
   caught by: test_apply_is_safe_to_call_repeatedly
   caught by: test_duplicate_webhook_delivery_records_one_payment
   caught by: test_out_of_order_delivery_ends_in_the_same_state
 
 [trust-the-idempotency-window]
-  defect: Skip the lookup by the planted ContactNumber and rely on the Idempotency-Key
-          alone -- correct for six minutes, after which the same key is processed as new
-          and the retry mints a dated twin.
-  how it is caught: A visible duplicate: a dated twin of the couple after the window
-          closes (scenario 1), and the rebuilt ledger after the window (scenarios 1 and 4).
+  defect: Skip the lookup by the planted ContactNumber and rely on the Idempotency-Key alone
+          -- correct for six minutes, after which the same key is processed as new and the
+          retry mints a dated twin.
+  how it is caught: A visible duplicate: a dated twin of the couple after the window closes (scenario
+          1), and the rebuilt ledger after the window (scenarios 1 and 4).
   caught by: test_a_5xx_is_an_unknown_outcome_not_a_rejection
   caught by: test_a_holder_carrying_our_contact_number_is_adopted_not_suffixed
   caught by: test_a_number_collision_is_settled_by_the_lookup_whatever_the_message_says
+  caught by: test_a_plain_text_404_still_proves_the_number_absent
   caught by: test_a_rebuilt_ledger_after_the_window_adopts_the_invoice_by_number_and_the_payment_by_reference
   caught by: test_a_rebuilt_ledger_re_derives_every_key_and_number_and_creates_nothing[after-the-window]
   caught by: test_after_the_window_the_key_is_new_and_only_the_contact_number_settles_it
@@ -412,28 +466,33 @@ Three of those results say something true rather than something flattering:
 * **`no-durable-intent` doubles nothing.** With the external keys planted,
   a recovery that forgot it was mid-call resends, Xero refuses on the
   planted `ContactNumber` or `InvoiceNumber`, and the refusal triggers the
-  same lookup -- one entity either way. The crash tests catch the mutation
-  by counting requests on the fake's wire (one create, ever) and by reading
-  the intent row back, **not by finding a duplicate**. The row buys the
-  lookup-before-resend, the settled name variant, the attempt and the
-  project mode; it is not what prevents the duplicate here. Correct
+  same lookup -- one entity either way. What actually fires, read off the
+  list above: the crash tests (1b, 2d, 4f, 4i) fail on their **first**
+  assertion, that the killed child left an intent row -- their wire counts
+  never run; 1e and 4k fail reading the intent row back; the ledger tests
+  fail on the missing row; and the two wire checks that do fire are 3f and
+  3g, where the next run must look up by `ContactNumber` before it resends.
+  The payment crash test's PUT count could not catch this on its own,
+  because payments look first anyway. **No test finds a duplicate.** The row
+  buys the lookup-before-resend, the settled name variant, the attempt and
+  the project mode; it is not what prevents the duplicate here. Correct
   behaviour, said out loud, not a coverage gap.
 * **`trust-the-idempotency-window` is the Xero-specific one.** Skip the
   lookup by `ContactNumber` and rely on the key, and every test that
   finishes inside six minutes with nothing in doubt stays green. The
   visible duplicate -- the dated twin -- appears only where the clock moves
   past the window: the redelivery seven minutes later (1h) and the rebuilt
-  ledger after the window (1j, 4o). The other five catches are the lookup's
-  absence on the wire or an adoption that did not happen (1b, 1k, 1l, 3f,
-  3g), not a duplicate. That is the difference from QBO in one mutation:
-  there a replayable `requestid` made the key alone sufficient; here it is
-  sufficient for six minutes.
-* **`silent-project-fallback` is caught 27 times, and mostly by the
+  ledger after the window (1j, 4o). The other six catches are the lookup's
+  absence on the wire or an adoption that did not happen (1b, 1k, 1l, 1m,
+  3f, 3g), not a duplicate. That is the difference from QBO in one
+  mutation: there a replayable `requestid` made the key alone sufficient;
+  here it is sufficient for six minutes.
+* **`silent-project-fallback` is caught 32 times, and mostly by the
   database.** Recording `projects_api` with no project id violates the
   `CHECK` on the `deals` table, so every deal that meets the 403 fails on
   the write, not on an assertion about the notice. Only
   `test_an_organisation_without_projects_is_flagged_and_still_invoiced`
-  asserts the honest path itself; the other 26 are the schema refusing to
+  asserts the honest path itself; the other 31 are the schema refusing to
   store a project that does not exist. That is the constraint doing the job
   it was added for -- and a reminder that a mutation which also lies to the
   database is the easy one to catch.
@@ -451,10 +510,13 @@ This is the part a demo skips and a quarter-end discovers.
   organisation does not have it.
 * **An organisation without it answers `403`.** So does a token that was not
   granted the `projects` scope, and the two look the same on the wire. The
-  sync reads the granted scopes off the token response first: without
-  `projects`, the `403` is the app's authorisation mistake and is escalated;
-  with it, the `403` is read as the plan (an assumption, see below) and
-  recorded as `project_mode = unavailable`, with a notice.
+  sync reads the granted scopes off the access token's JWT `scope` claim
+  first (the token response carries no `scope` field): without `projects`,
+  the `403` is the app's authorisation mistake and is escalated; with it,
+  the `403` is read as the plan (an assumption, see below) and recorded as
+  `project_mode = unavailable`, with a notice; and when the scopes cannot
+  be read at all, the `403` is escalated, because it is then evidence of
+  nothing.
 * **A project name is not unique** (the docs do not say either way; the
   harder reading is modelled), so an in-flight create cannot be settled by
   resending. It is settled the way the QBO GraphQL path was: look for the
@@ -482,16 +544,21 @@ made, and let the difference be found by whoever opens Xero Projects first.
 ```
 xero_idempotent_sync_proof/
   ledger.py        # SQLite operational record: intent-before-send, derived keys and
-                   # planted numbers, attempt counter, unique bindings, project_mode CHECK
+                   # planted numbers, attempt counter (contact/invoice only), unique bindings,
+                   # project_mode CHECK, schema_version upgrade of older files
   auth.py          # OAuth 2.0 refresh with rotation, persisted every time; granted scopes
+                   # read from the access token's JWT claim
   client.py        # transport that keeps "failed" and "unknown" apart; xero-tenant-id and
-                   # Idempotency-Key on every create; 429 -> same request within the window;
-                   # 401 -> refresh once; 5xx -> unknown; paged Projects lookup
+                   # Idempotency-Key on every create; status before body (plain-text 404 =
+                   # absent); 429 -> same request within the window; 401 -> refresh once;
+                   # 5xx -> unknown; paged Projects lookup
   sync.py          # the step machine: contact -> project -> invoice -> payments -> read-back;
-                   # interrogate-first recovery; the honest project path; the anti-patterns
+                   # interrogate-first recovery that walks on past any exception; the honest
+                   # project path; the anti-patterns
   fake_xero.py     # Xero on a socket: six-minute key store with a clock, cached errors,
-                   # different-request 400, unique Name/ContactNumber/InvoiceNumber, payments
-                   # on AUTHORISED only, gated and paged Projects, rotation with grace, 429, faults
+                   # different-request 400, unique Name/ContactNumber/InvoiceNumber, plain-text
+                   # 404, payments on AUTHORISED only, gated and paged Projects, JWT-shaped
+                   # tokens, rotation with grace, 429, faults
   _crash_child.py  # a worker killed for real with os._exit, mid-step
 scripts/
   verify_the_suite_bites.py   # mutation harness (7 defects)
@@ -542,11 +609,14 @@ production use. Specifically, the fake models these documented facts:
   50 by default and 500 at most, with `pagination.pageCount`; scope
   `projects`.
   [Projects](https://developer.xero.com/documentation/api/projects/projects)
-* OAuth 2.0: `POST https://identity.xero.com/connect/token`; access token
-  30 minutes; refresh token 60 days, rotating on every refresh, the
-  previous one valid for a 30-minute grace period; `xero-tenant-id` on
-  every API call, resolved from `GET https://api.xero.com/connections`;
-  `offline_access` for a refresh token.
+* OAuth 2.0: `POST https://identity.xero.com/connect/token`; the response
+  carries `access_token`, `expires_in`, `token_type`, `refresh_token` (and
+  `id_token` with OpenID) -- no `scope` field; the access token is a JWT
+  that can be decoded; access token 30 minutes; refresh token 60 days,
+  rotating on every refresh, the previous one valid for a 30-minute grace
+  period; `xero-tenant-id` on every API call, resolved from
+  `GET https://api.xero.com/connections`; `offline_access` for a refresh
+  token.
   [Auth flow](https://developer.xero.com/documentation/guides/oauth2/auth-flow),
   [managing tokens](https://developer.xero.com/documentation/best-practices/data-integrity/managing-tokens)
 * Rate limits: 60 calls per minute per tenant, 5 concurrent, 1,000 per day
@@ -555,7 +625,10 @@ production use. Specifically, the fake models these documented facts:
   `X-MinLimit-Remaining` and `X-DayLimit-Remaining` on every response.
   [Limits](https://developer.xero.com/documentation/guides/oauth2/limits)
 * Scopes for an app created since 2026-03-02 (granular): `offline_access
-  accounting.contacts accounting.invoices accounting.payments projects`.
+  accounting.contacts accounting.invoices accounting.payments
+  accounting.settings.read projects` -- `accounting.settings.read` is what
+  `GET /Organisation` needs, and the `IsDemoCompany` guard of the live
+  smoke reads it.
   [Scopes](https://developer.xero.com/documentation/guides/oauth2/scopes)
 * A free Xero account comes with a demo company, which `GET /Organisation`
   reports as `IsDemoCompany: true`; its data is reset 28 days after
@@ -573,7 +646,15 @@ the demo company before relying on it:
   sync never keys on it;
 * `GET /Contacts/{ContactNumber}` for a number nobody carries answers
   **404** (the docs say the number is a valid path key, not what a miss
-  returns); anything other than a 404 is raised, never read as absent;
+  returns), and that 404 is served as **plain text** -- "The resource
+  you're looking for cannot be found", the body Xero commonly sends -- so
+  the client is shown to read the status, not the shape; anything other
+  than a 404 is raised, never read as absent;
+* the access token's granted scopes are a **`scope` claim, an array of
+  strings**, in the JWT (the docs say the token is a decodable JWT and that
+  the token response has no `scope` field; the claim's name and shape
+  follow the IdentityServer convention and are not spelled out); when it
+  cannot be read, the sync treats the scopes as unknown, not as none;
 * `where=Name=="..."` is modelled **case-insensitive only**; the documented
   accent-insensitivity is not modelled;
 * a quote inside a `where` string literal is escaped as `\"` (the escape
@@ -586,9 +667,9 @@ the demo company before relying on it:
 * inside the grace period, a refresh with the **retired** token rotates
   again and retires the *newest* token (the docs say the old one can be
   used for 30 minutes; what happens to the new one is not stated);
-* the exact bodies of the `401`, `403`, `404` and `429` responses, and of the
-  Projects API's `400`, which the client detects by status code rather than
-  by shape;
+* the exact bodies of the `401`, `403` and `429` responses (a JSON problem
+  shape here), and of the Projects API's `400`; the client branches on the
+  status code for the first three and reads a body only on a `400`;
 * the message for a payment on a non-`AUTHORISED` invoice and for a
   `ContactNumber` over 50 characters (neither is in the examples);
 * a replay returns the original **status code** as well as the body.
