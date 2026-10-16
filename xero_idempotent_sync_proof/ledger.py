@@ -80,9 +80,13 @@ def idempotency_key_for(deal_id: str, step: str, ref: str = "", attempt: int = 0
 
     ``attempt`` is 0 for the first send, and the key is then exactly what a
     rebuilt ledger re-derives. It is bumped only when Xero **provably
-    rejected** the send with a validation ``400``: Xero caches that 400 under
-    the key for six minutes, so the corrected send needs a key Xero has never
-    seen. Nothing was created under the old key, so nothing can be doubled.
+    rejected** the send with a validation ``400`` -- and only for the steps
+    Xero refuses to duplicate on a planted unique field (contact, invoice):
+    Xero caches that 400 under the key for six minutes, so the corrected send
+    needs a key Xero has never seen, and a second replica on another attempt
+    is refused on the number and adopts. A look-first step (payment, project)
+    keeps attempt 0 forever: its one derived key is what settles two replicas
+    racing, and a per-ledger counter in the key would break exactly that.
     """
     material = f"{deal_id}:{step}" + (f":{ref}" if ref else "")
     if attempt:
@@ -335,7 +339,8 @@ class Ledger:
         Where it would be load-bearing on its own is a step with no plantable
         key and a dead key window -- which this design has none of, by
         construction. The second replica racing the first is settled by the
-        *derived* key, not by this row (see scenario 4).
+        planted unique number (contact, invoice) or by the one *derived* key
+        (payment, project), not by this row (see scenario 4).
         """
         key = idempotency_key_for(deal_id, step, ref)
         assert len(key) <= IDEMPOTENCY_KEY_MAX_LEN
@@ -381,9 +386,12 @@ class Ledger:
 
         A validation ``400`` is cached under its key for six minutes, so a
         corrected resend under the same key gets the same 400 back. The
-        attempt counter is persisted, so every process derives the same new
-        key; the step stays ``PENDING`` and is looked up before the resend
-        like any other in-flight step. Nothing was created under the old key.
+        attempt counter is persisted, so every process *on this ledger*
+        derives the same new key; the step stays ``PENDING`` and is looked up
+        before the resend like any other in-flight step. Nothing was created
+        under the old key. The sync calls this only for the contact and
+        invoice steps, where a second replica on another attempt is refused
+        on the planted number; never for a payment or a project.
         """
         current = self.get_intent(deal_id, step, ref)
         assert current is not None, "bump_attempt on a step that was never begun"

@@ -49,7 +49,25 @@ the planted ``ContactNumber`` or ``InvoiceNumber`` and the refusal triggers
 the lookup. The row saves that blind resend, removes the dependence on Xero
 refusing, and keeps the settled name variant, the attempt and the project
 mode. It is the planted keys and the look-first rule that prevent the
-duplicate; the derived key, not the row, is what settles two replicas racing.
+duplicate, not the row.
+
+Two replicas racing -- separate ledgers, same delivery, both past the
+lookup -- are settled step by step, and the guarantee differs:
+
+* **contact, invoice**: by the planted unique ``ContactNumber`` /
+  ``InvoiceNumber``. The second send is refused and adopts the first,
+  whatever key it carried; so these steps may bump their key after a real
+  validation 400 (the cached 400 would otherwise replay for six minutes);
+* **payment, project**: by the **one derived key**, inside the six-minute
+  window, and by nothing after it. The key is therefore never changed: a
+  per-ledger attempt counter in the key would make two replicas send two
+  keys and book the instalment twice. A cached 400 pins these steps for at
+  most six minutes instead, with the reason on the deal row.
+
+The race between a send and the window closing -- replica A sends at
+minute 0, replica B looks up and sends at minute 6:01 before A's payment is
+visible -- is not closed by this design and cannot be with what Xero
+offers; it is a window of seconds against a lookup that is immediate.
 
 Known limit -- several replicas sharing one refresh token: ``auth.py`` has
 no lock or compare-and-swap. If two replicas with separate token stores
@@ -72,6 +90,7 @@ from typing import Any, Callable
 
 from .client import Created, ProjectsApiUnavailable, UnknownOutcome, XeroClient, XeroRejected
 from .ledger import (
+    IDEMPOTENCY_TTL_SECONDS,
     PROJECT_MODE_PROJECTS_API,
     PROJECT_MODE_UNAVAILABLE,
     REJECTED,
@@ -103,6 +122,10 @@ MAX_NAME_VARIANTS = 2
 # Chart-of-accounts configuration is out of scope; these match the fake.
 SALES_ACCOUNT_CODE = "200"
 BANK_ACCOUNT_CODE = "090"
+
+# The steps whose key may change after a provable rejection: only those Xero
+# refuses to duplicate on a planted unique field. See ``SyncEngine._rejected``.
+BUMP_ATTEMPT_ON_REJECTION = frozenset({STEP_CONTACT, STEP_INVOICE})
 
 # Xero's refusals, by the fragment the sync keys on. Both are verbatim from
 # the official OpenAPI examples. The duplicate-ContactNumber refusal has no
@@ -628,18 +651,48 @@ class SyncEngine:
         """A real validation 400 that no lookup settles: Xero said no, and will say it again.
 
         The 400 is cached under the key for six minutes, so a resend after the
-        cause is fixed would get the cached 400 back. Bump the persisted
-        attempt: the next send derives a key Xero has never seen. Only a 400
-        qualifies -- a 429 was never processed and keeps its key.
+        cause is fixed gets the cached 400 back. What the sync does about that
+        depends on the step:
+
+        * **contact, invoice** (send-first; Xero refuses a duplicate loudly on
+          the planted ``ContactNumber`` / ``InvoiceNumber``): bump the
+          persisted ``attempt`` so the corrected send derives a key Xero has
+          never seen. Nothing was created under the old key. If two replicas
+          with separate ledgers end up on different attempts, their sends go
+          out under different keys -- and the second is refused on the planted
+          number and adopts the first. Race safety here rests on the unique
+          number, not on the key;
+        * **payment, project** (look-first; nothing in Xero refuses the
+          duplicate): the key is **never** bumped. A per-ledger counter folded
+          into the key would make two replicas derive different keys for the
+          same instalment, and past the window both would look, see nothing,
+          send -- and book it twice. The one derived key is what settles that
+          race, so the step stays on it: the cached 400 pins the step for at
+          most ``IDEMPOTENCY_TTL_SECONDS``, the row says why
+          (``last_error``), and the send after the window is processed as
+          new, under the same key.
+
+        Only a 400 qualifies -- a 429 was never processed and keeps its key.
         """
         if exc.status != 400:
             return
+        where = f"{intent.step}[{intent.ref}]" if intent.ref else intent.step
+        if intent.step not in BUMP_ATTEMPT_ON_REJECTION:
+            log.info(
+                "rejected %s step=%s under key=%s (HTTP 400: %s); look-first step, key kept: a cached "
+                "400 pins it for at most %ds, then the same key is processed as new",
+                intent.deal_id,
+                where,
+                intent.idempotency_key,
+                "; ".join(exc.messages)[:160],
+                IDEMPOTENCY_TTL_SECONDS,
+            )
+            return
         bumped = self.ledger.bump_attempt(intent.deal_id, intent.step, intent.ref)
         log.info(
-            "rejected %s step=%s%s under key=%s (HTTP 400: %s); next send derives key=%s (attempt %d)",
+            "rejected %s step=%s under key=%s (HTTP 400: %s); next send derives key=%s (attempt %d)",
             intent.deal_id,
-            intent.step,
-            f"[{intent.ref}]" if intent.ref else "",
+            where,
             intent.idempotency_key,
             "; ".join(exc.messages)[:160],
             bumped.idempotency_key,

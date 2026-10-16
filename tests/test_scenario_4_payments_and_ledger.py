@@ -315,23 +315,23 @@ def test_two_payments_with_our_reference_escalate_instead_of_guessing(
     assert len(xero.payments) == 2 and len(payment_puts(xero)) == 2, "recovery reported; it did not resend"
 
 
-def test_a_cached_rejection_does_not_pin_the_payment_for_six_minutes(
+def test_a_cached_rejection_pins_the_payment_for_at_most_six_minutes(
     xero, engine_factory, make_webhook
 ):
     """Xero caches errors under the key too -- the second trap of the idempotency store.
 
     The bank account the payment books to is not in the chart yet, so the
     payment is a real 400. Resend the same key after the accountant adds the
-    account and Xero replays the cached 400 for six minutes. The sync records
-    the rejection on the deal, bumps the step's attempt, and the next send
-    goes out under a fresh derived key -- so the fix takes effect at once,
-    and nothing was ever created under the old key for it to duplicate.
+    account and Xero replays the cached 400 for six minutes. The sync does
+    **not** mint a fresh key to get around that: a payment is a look-first
+    step, and the one derived key is what makes two replicas' sends collapse
+    into one. So the deal records the rejection, the step stays pinned on the
+    cached 400 for at most the window, and the send after the window goes
+    through -- under the same key, exactly once.
     """
     webhook = make_webhook(amount=2500.0)
     xero.remove_bank_account("090")
     key0 = idempotency_key_for("deal-1001", STEP_PAYMENT, "pay-1")
-    key1 = idempotency_key_for("deal-1001", STEP_PAYMENT, "pay-1", attempt=1)
-    key2 = idempotency_key_for("deal-1001", STEP_PAYMENT, "pay-1", attempt=2)
 
     engine = engine_factory(xero)
     with pytest.raises(XeroRejected) as exc:
@@ -340,22 +340,71 @@ def test_a_cached_rejection_does_not_pin_the_payment_for_six_minutes(
     deal = engine.ledger.get_deal("deal-1001")
     assert deal.sync_status == SYNC_ERROR and "The specified account could not be found" in deal.last_error
     intent = engine.ledger.get_intent("deal-1001", STEP_PAYMENT, "pay-1")
-    assert intent.attempt == 1 and intent.idempotency_key == key1, "the next send will not hit the cache"
+    assert intent.attempt == 0 and intent.idempotency_key == key0, "a look-first step keeps its key"
 
-    # Still broken, a moment later: a fresh key, a fresh 400, not a replay.
+    # The accountant adds the account a moment later. The cached 400 is
+    # replayed: the payment is pinned, honestly recorded, nothing created.
+    xero.add_bank_account("090")
     with pytest.raises(XeroRejected):
         engine_factory(xero).apply(webhook)
-    assert [r.split("key=")[1] for r in payment_puts(xero)] == [key0, key1]
-    assert not any(r.startswith("REPLAY") for r in xero.request_log), "never the cached 400"
+    assert len(xero.payments) == 0
+    assert any(r.startswith("REPLAY PUT /api.xro/2.0/Payments") for r in xero.request_log), "the cached 400"
+    pinned = engine_factory(xero).ledger.get_deal("deal-1001")
+    assert pinned.sync_status == SYNC_ERROR and "The specified account could not be found" in pinned.last_error
 
-    # The accountant adds the account. The clock has not moved at all.
-    xero.add_bank_account("090")
+    # The window closes. Same key, processed as new, one payment.
+    xero.advance(IDEMPOTENCY_TTL_SECONDS + 1)
     deal = engine_factory(xero).apply(webhook)
 
     assert deal.sync_status == SYNC_SYNCED and len(xero.payments) == 1
     assert deal.amount_paid == 2500.0 and deal.last_error is None
-    assert [r.split("key=")[1] for r in payment_puts(xero)] == [key0, key1, key2]
-    assert key0 in xero.idempotency_keys, "the cached 400 is still there; the sync simply stopped using it"
+    assert {r.split("key=")[1] for r in payment_puts(xero)} == {key0}, "one key, ever, for this instalment"
+
+
+def test_two_replicas_with_unequal_rejection_counts_still_book_one_payment(
+    xero, engine_factory, make_webhook, tmp_path
+):
+    """Why the payment's key is never bumped: separate ledgers count separately.
+
+    Two replicas with their own databases both hit the cached 400 (the bank
+    account is missing) -- the primary twice, the replica once. If a
+    rejection bumped a per-ledger attempt counter into the key, the two
+    would now derive *different* keys for the same instalment; past the
+    window both look first, both see nothing, both send, and neither send
+    is a replay of the other: **two payments for one instalment**. With one
+    derived key per instalment, the race ends as scenario 4b does -- in a
+    replay.
+    """
+    webhook = make_webhook(amount=2500.0)
+    xero.remove_bank_account("090")
+    primary_path = str(tmp_path / "primary.db")
+    replica_path = str(tmp_path / "replica.db")
+    key0 = idempotency_key_for("deal-1001", STEP_PAYMENT, "pay-1")
+
+    for _ in range(2):  # the primary retries while the account is still missing
+        with pytest.raises(XeroRejected):
+            engine_factory(xero, path=primary_path).apply(webhook)
+    with pytest.raises(XeroRejected):  # the replica tries once
+        engine_factory(xero, path=replica_path).apply(webhook)
+    assert xero.payments == {}
+
+    xero.add_bank_account("090")
+    xero.advance(IDEMPOTENCY_TTL_SECONDS + 1)  # the cached 400s expire; the account was fixed "later"
+    replica = engine_factory(xero, path=replica_path)
+
+    def the_other_replica_wins_the_race(seam: str) -> None:
+        if seam == "before_payment_send":
+            replica.apply(webhook)
+
+    deal = engine_factory(xero, path=primary_path, on_seam=the_other_replica_wins_the_race).apply(webhook)
+
+    keys = [r.split("key=")[1] for r in payment_puts(xero)]
+    assert len(xero.payments) == 1, f"{len(xero.payments)} payments booked for one instalment; PUT keys {keys}"
+    assert set(keys) == {key0}, "every send of this instalment, from either replica, carried the same key"
+    assert deal.amount_paid == 2500.0 and deal.sync_status == SYNC_SYNCED
+    ours = {p.xero_payment_id for p in engine_factory(xero, path=primary_path).ledger.payments_for("deal-1001")}
+    theirs = {p.xero_payment_id for p in replica.ledger.payments_for("deal-1001")}
+    assert ours == theirs == set(xero.payments), "both ledgers bound the same PaymentID"
 
 
 def test_a_strangers_payment_carrying_our_reference_is_not_adopted(

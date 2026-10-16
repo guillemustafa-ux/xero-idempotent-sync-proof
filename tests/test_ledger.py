@@ -89,26 +89,28 @@ def test_begin_step_twice_keeps_the_first_intent(ledger_factory, make_webhook):
 def test_a_rejected_step_derives_a_fresh_key_from_its_attempt(ledger_factory, make_webhook):
     """Xero caches a 400 under its key for six minutes. The fix must not wait for it.
 
-    Attempt 0 derives the key the rebuilt-ledger guarantee relies on. A step
-    that Xero provably rejected bumps a persisted attempt counter, and the
-    next send goes out under ``{deal}:{step}:{ref}:attempt{n}`` -- a key Xero
-    has never seen, so the corrected send is processed, not replayed.
+    Attempt 0 derives the key the rebuilt-ledger guarantee relies on. A
+    send-first step (contact, invoice) that Xero provably rejected bumps a
+    persisted attempt counter, and the next send goes out under
+    ``{deal}:{step}:{ref}:attempt{n}`` -- a key Xero has never seen, so the
+    corrected send is processed, not replayed. (The sync never does this for
+    a payment or a project; see scenario 4.)
     """
     ledger = ledger_factory()
     deal_id = ledger.record_webhook(make_webhook())
-    first = ledger.begin_step(deal_id, STEP_PAYMENT, "pay-1")
+    first = ledger.begin_step(deal_id, STEP_INVOICE)
     assert first.attempt == 0
-    assert first.idempotency_key == idempotency_key_for(deal_id, STEP_PAYMENT, "pay-1")
-    assert idempotency_key_for(deal_id, STEP_PAYMENT, "pay-1", attempt=0) == first.idempotency_key
+    assert first.idempotency_key == idempotency_key_for(deal_id, STEP_INVOICE)
+    assert idempotency_key_for(deal_id, STEP_INVOICE, attempt=0) == first.idempotency_key
 
-    bumped = ledger.bump_attempt(deal_id, STEP_PAYMENT, "pay-1")
+    bumped = ledger.bump_attempt(deal_id, STEP_INVOICE)
 
     assert bumped.attempt == 1 and bumped.state == PENDING
-    assert bumped.idempotency_key == idempotency_key_for(deal_id, STEP_PAYMENT, "pay-1", attempt=1)
+    assert bumped.idempotency_key == idempotency_key_for(deal_id, STEP_INVOICE, attempt=1)
     assert bumped.idempotency_key != first.idempotency_key
-    again = ledger_factory().get_intent(deal_id, STEP_PAYMENT, "pay-1")
+    again = ledger_factory().get_intent(deal_id, STEP_INVOICE)
     assert again.attempt == 1 and again.idempotency_key == bumped.idempotency_key, "persisted"
-    assert ledger.begin_step(deal_id, STEP_PAYMENT, "pay-1").idempotency_key == bumped.idempotency_key, (
+    assert ledger.begin_step(deal_id, STEP_INVOICE).idempotency_key == bumped.idempotency_key, (
         "begin_step after a bump hands back the bumped key, never attempt 0 again"
     )
 
