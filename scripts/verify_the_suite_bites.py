@@ -62,11 +62,15 @@ MUTATIONS = [
         evidence="NOT a visible duplicate. With the external keys planted, recovery "
         "without the row resends, Xero refuses on the planted ContactNumber or "
         "InvoiceNumber, and the refusal triggers the same lookup -- one entity "
-        "either way. What the suite catches is the blind resend itself: request "
-        "counts on the fake's wire (one PUT, ever, in the crash tests of scenarios "
-        "1 and 4) and the intent row the crash tests read back. The row buys the "
-        "lookup-before-resend, the settled name variant, the attempt and the "
-        "project mode; it is not what prevents the duplicate here.",
+        "either way. What fires, honestly: the crash tests of scenarios 1, 2 and 4 "
+        "fail on their FIRST assertion, that the killed child left an intent row "
+        "(their wire counts never run); the ledger tests fail on the missing row; "
+        "and the wire checks that do fire are scenario 3's 5xx and throttle-past-"
+        "the-window tests, where the next run must look up by ContactNumber before "
+        "it resends. The payment crash test's PUT count could not catch this on "
+        "its own: payments look first anyway. The row buys the lookup-before-"
+        "resend, the settled name variant, the attempt and the project mode; it "
+        "is not what prevents the duplicate here.",
         path=PKG / "ledger.py",
         old="        self._conn.execute(\n"
         '            "INSERT OR IGNORE INTO intents (deal_id, step, ref, idempotency_key, mode, state) "\n'
