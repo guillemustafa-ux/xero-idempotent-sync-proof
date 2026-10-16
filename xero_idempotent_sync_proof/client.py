@@ -25,10 +25,13 @@ concerns, not business ones:
   the transport's;
 * a ``429`` is answered by resending the *same* request -- same URL, same
   body, same key -- after the ``Retry-After`` the server asked for, **as long
-  as the waits add up to less than the six-minute key window**. Past that a
-  resend is processed as a new request, so the transport stops and raises
-  ``UnknownOutcome`` instead. The sleeper is injectable so the proof does not
-  sleep;
+  as the waits add up to less than the six-minute key window**. The 429s
+  themselves put nothing in Xero; the cap is for an *earlier* send under the
+  same key (a lost response, a killed process) whose window the wait does
+  not measure and may outlive -- a resend after it closes is processed as
+  new. Past the cap the transport stops with ``ThrottledPastWindow`` (an
+  ``UnknownOutcome``) and the sync looks up before it resends. The sleeper
+  is injectable so the proof does not sleep;
 * the **status code is read first**: a 401 refreshes once, a 404 is
   ``XeroNotFound`` (Xero's 404 is commonly plain text, so the body is not
   required), a 429 is throttling, a Projects 403 is the product gate. Only
@@ -78,6 +81,19 @@ REPLAY_HEADER = "X-Fake-Replayed"
 
 class UnknownOutcome(Exception):
     """The request may or may not have been applied. Do not retry blindly."""
+
+
+class ThrottledPastWindow(UnknownOutcome):
+    """Honouring the next ``Retry-After`` would carry the resend past the six-minute key window.
+
+    The 429s themselves were never processed, so *this* call put nothing in
+    Xero under the key. The risk is an **earlier** send under the same key --
+    a lost response, a process killed mid-call -- whose window opened before
+    this call started and which the accumulated wait does not measure. A
+    resend after it closes is processed as new, and would double that earlier
+    write. So the transport stops and the sync looks up before resending, as
+    it does for every unknown outcome.
+    """
 
 
 class XeroRejected(Exception):
@@ -272,14 +288,16 @@ class XeroClient:
                         raise XeroRejected(exc.code, raw) from exc
                     wait = self._retry_after(exc.headers.get("Retry-After"))
                     if waited + wait >= IDEMPOTENCY_TTL_SECONDS:
-                        # Waiting this long would carry the resend past the
-                        # key window, where it is processed as new. If an
-                        # earlier send under this key did land, that resend
-                        # is the duplicate. Stop here; let the sync look up.
-                        raise UnknownOutcome(
+                        # The 429s were never processed: this call put no
+                        # key in Xero. The hazard is an EARLIER send under
+                        # the same key whose window may close while we wait
+                        # -- the wait does not measure it. Stop; let the
+                        # sync look up before it resends.
+                        raise ThrottledPastWindow(
                             f"{method} {url}: throttled; honouring Retry-After={wait:g}s after "
-                            f"{waited:g}s already waited would cross the {IDEMPOTENCY_TTL_SECONDS}s "
-                            "idempotency window, so the key could no longer make a resend safe"
+                            f"{waited:g}s already waited would carry a resend past the "
+                            f"{IDEMPOTENCY_TTL_SECONDS}s idempotency window of any earlier send "
+                            "under this key, so the key could no longer make the resend safe"
                         ) from exc
                     # Same URL, same body, same key: if the first send did
                     # land, Xero replays it instead of doubling it.

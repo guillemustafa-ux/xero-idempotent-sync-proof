@@ -16,7 +16,7 @@ from xero_idempotent_sync_proof.auth import (
     TokenStore,
     refresh_but_keep_the_old_refresh_token,
 )
-from xero_idempotent_sync_proof.client import UnknownOutcome, XeroRejected
+from xero_idempotent_sync_proof.client import ThrottledPastWindow, UnknownOutcome, XeroRejected
 from xero_idempotent_sync_proof.fake_xero import REFRESH_GRACE_SECONDS
 from xero_idempotent_sync_proof.ledger import (
     IDEMPOTENCY_TTL_SECONDS,
@@ -229,21 +229,26 @@ def test_throttling_that_would_outlast_the_key_window_stops_and_asks(
 ):
     """``Retry-After`` is honoured -- up to the point where honouring it crosses six minutes.
 
-    Two 429s with ``Retry-After: 200`` add up to 400 seconds of waiting. A
-    send after that is "processed as a new key": if an earlier send under
-    this key did land, the resend is the duplicate. So the transport stops
-    at the window's edge and raises ``UnknownOutcome``; the sync then does
-    what it does with every unknown outcome -- it looks up first.
+    Two 429s with ``Retry-After: 200`` add up to 400 seconds of waiting. The
+    429s themselves were never processed, so *this call* put nothing in Xero
+    under the key. What the cap guards against is an **earlier** send under
+    the same key -- a lost response, a killed process -- whose six minutes
+    the accumulated wait does not measure and may have outlived: a resend
+    past the window would be processed as new and duplicate it. So the
+    transport stops at the window's edge with ``ThrottledPastWindow`` (an
+    ``UnknownOutcome``), and the sync does what it does with every unknown
+    outcome -- it looks up first.
     """
     slept: list[float] = []
     client = client_factory(xero, sleep=slept.append)
     xero.throttle_next(2, retry_after=200)
 
-    with pytest.raises(UnknownOutcome) as exc:
+    with pytest.raises(ThrottledPastWindow) as exc:
         client.create_contact(CONTACT, idempotency_key=KEY)
 
+    assert isinstance(exc.value, UnknownOutcome), "a throttle past the window is one kind of unknown"
     assert slept == [200.0], "the first wait fit; the second would have crossed the window"
-    assert str(IDEMPOTENCY_TTL_SECONDS) in str(exc.value)
+    assert str(IDEMPOTENCY_TTL_SECONDS) in str(exc.value) and "earlier" in str(exc.value)
     assert xero.contacts == {}
     throttled = [r for r in xero.request_log if r.startswith("429")]
     assert len(throttled) == 2 and all(f"key={KEY}" in r for r in throttled)
