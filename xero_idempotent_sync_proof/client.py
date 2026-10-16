@@ -24,8 +24,14 @@ concerns, not business ones:
   minutes. What settles the question after that is the sync's business, not
   the transport's;
 * a ``429`` is answered by resending the *same* request -- same URL, same
-  body, same key -- after the ``Retry-After`` the server asked for. The
-  sleeper is injectable so the proof does not sleep.
+  body, same key -- after the ``Retry-After`` the server asked for, **as long
+  as the waits add up to less than the six-minute key window**. Past that a
+  resend is processed as a new request, so the transport stops and raises
+  ``UnknownOutcome`` instead. The sleeper is injectable so the proof does not
+  sleep;
+* a **5xx**, or any answer whose body is not a Xero JSON body, is an
+  ``UnknownOutcome``, not a rejection: a gateway can answer 502 after the
+  request was handed on, and a 500 can come back after the row was committed.
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .auth import Authenticator
+from .ledger import IDEMPOTENCY_TTL_SECONDS
 
 XERO_API_URL = "https://api.xero.com"
 
@@ -69,7 +76,7 @@ class UnknownOutcome(Exception):
 
 
 class XeroRejected(Exception):
-    """Xero answered with an error status. Nothing was applied."""
+    """Xero answered with a 4xx and a Xero body. Nothing was applied."""
 
     def __init__(self, status: int, body: str):
         super().__init__(f"HTTP {status}: {body}")
@@ -109,6 +116,17 @@ def validation_messages(body: str) -> list[str]:
             if err.get("Message"):
                 out.append(err["Message"])
     return out
+
+
+def _looks_like_xero(body: str) -> bool:
+    """Whether an error body is a JSON object or array, as every Xero error is.
+
+    An HTML page from a proxy, or an empty body, is not Xero speaking.
+    """
+    try:
+        return isinstance(json.loads(body), (dict, list))
+    except ValueError:
+        return False
 
 
 def where_quote(value: str) -> str:
@@ -181,6 +199,7 @@ class XeroClient:
         data = json.dumps(body).encode("utf-8") if body is not None else None
         refreshed = False
         attempt = 0
+        waited = 0.0
         while True:
             req = urllib.request.Request(url, data=data, method=method)
             req.add_header("Accept", "application/json")
@@ -194,12 +213,28 @@ class XeroClient:
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     raw = resp.read().decode("utf-8")
-                    return _Response(
-                        resp.status, json.loads(raw) if raw else {}, dict(resp.headers)
-                    )
+                    try:
+                        parsed = json.loads(raw) if raw else {}
+                    except ValueError:
+                        # A 2xx that is not JSON did not come from Xero's
+                        # API. Something in between answered; the write's
+                        # fate is as unknown as after a dropped connection.
+                        raise UnknownOutcome(
+                            f"{method} {url}: HTTP {resp.status} with a body that is not "
+                            f"JSON: {raw[:120]!r}"
+                        ) from None
+                    return _Response(resp.status, parsed, dict(resp.headers))
             except urllib.error.HTTPError as exc:
-                # The server spoke. Whatever it says, it is a definite answer.
                 raw = exc.read().decode("utf-8", "replace")
+                if exc.code >= 500 or not _looks_like_xero(raw):
+                    # The server, or something in front of it, failed. That
+                    # is not a verdict on the write: a gateway can time out
+                    # after handing the request on. Do not read it as "no".
+                    raise UnknownOutcome(
+                        f"{method} {url}: HTTP {exc.code} is not a Xero answer; the write's "
+                        f"fate is unknown: {raw[:120]!r}"
+                    ) from exc
+                # A 4xx with a Xero body: a definite answer.
                 if exc.code == 401 and not refreshed:
                     # Access token expired under us. One refresh, one retry.
                     self.auth.refresh()
@@ -208,9 +243,21 @@ class XeroClient:
                 if exc.code == 429:
                     if attempt >= self.max_throttle_retries:
                         raise XeroRejected(exc.code, raw) from exc
+                    wait = self._retry_after(exc.headers.get("Retry-After"))
+                    if waited + wait >= IDEMPOTENCY_TTL_SECONDS:
+                        # Waiting this long would carry the resend past the
+                        # key window, where it is processed as new. If an
+                        # earlier send under this key did land, that resend
+                        # is the duplicate. Stop here; let the sync look up.
+                        raise UnknownOutcome(
+                            f"{method} {url}: throttled; honouring Retry-After={wait:g}s after "
+                            f"{waited:g}s already waited would cross the {IDEMPOTENCY_TTL_SECONDS}s "
+                            "idempotency window, so the key could no longer make a resend safe"
+                        ) from exc
                     # Same URL, same body, same key: if the first send did
                     # land, Xero replays it instead of doubling it.
-                    self.sleep(self._retry_after(exc.headers.get("Retry-After")))
+                    self.sleep(wait)
+                    waited += wait
                     attempt += 1
                     continue
                 if exc.code == 403 and url.startswith(self._projects()):

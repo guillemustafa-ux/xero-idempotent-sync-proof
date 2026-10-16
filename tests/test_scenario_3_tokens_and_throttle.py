@@ -16,8 +16,16 @@ from xero_idempotent_sync_proof.auth import (
     TokenStore,
     refresh_but_keep_the_old_refresh_token,
 )
+from xero_idempotent_sync_proof.client import UnknownOutcome, XeroRejected
 from xero_idempotent_sync_proof.fake_xero import REFRESH_GRACE_SECONDS
-from xero_idempotent_sync_proof.ledger import STEP_CONTACT, idempotency_key_for
+from xero_idempotent_sync_proof.ledger import (
+    IDEMPOTENCY_TTL_SECONDS,
+    STEP_CONTACT,
+    SYNC_ERROR,
+    SYNC_SYNCED,
+    contact_number_for,
+    idempotency_key_for,
+)
 
 CONTACT = {"Name": "Ana Perez & Tomas Ruiz", "ContactNumber": "hs-deal-1001"}
 KEY = idempotency_key_for("deal-1001", STEP_CONTACT, "0")
@@ -125,3 +133,69 @@ def test_a_throttled_create_resends_the_same_key_and_makes_one_contact(xero, cli
     sends = [r for r in xero.request_log if r == f"PUT /api.xro/2.0/Contacts key={KEY}"]
     assert len(sends) == 1, "the throttled attempts never reached the create; the third did"
     assert len(xero.contacts) == 1
+
+
+def contact_puts(xero) -> list[str]:
+    return [r for r in xero.request_log if r.startswith("PUT /api.xro/2.0/Contacts key=")]
+
+
+def test_a_5xx_is_an_unknown_outcome_not_a_rejection(xero, engine_factory, make_webhook):
+    """A 503 -- or any answer that is not a Xero body -- says nothing about the write.
+
+    A gateway can answer 502 after the request was handed on; a 500 can come
+    back after the row was committed. Reading it as "rejected, nothing
+    happened" is the same bug as reading a dropped connection that way. The
+    transport keeps it ``UnknownOutcome``, the deal row records it, and the
+    next run looks up by the planted number before sending again.
+    """
+    webhook = make_webhook()
+    xero.fail_next_with(503)
+
+    with pytest.raises(UnknownOutcome) as exc:
+        engine_factory(xero).apply(webhook)
+    assert "503" in str(exc.value) and not isinstance(exc.value, XeroRejected)
+    assert xero.contacts == {}, "this 503 happened to land before anything was committed"
+    doubtful = engine_factory(xero).ledger.get_deal("deal-1001")
+    assert doubtful.sync_status == SYNC_ERROR and "UnknownOutcome" in doubtful.last_error
+
+    deal = engine_factory(xero).apply(webhook)
+
+    assert len(xero.contacts) == 1 and deal.sync_status == SYNC_SYNCED
+    number = contact_number_for("deal-1001")
+    assert f"GET /api.xro/2.0/Contacts/{number} key=-" in xero.request_log, "looked up before resending"
+    assert len(contact_puts(xero)) == 1, "the 503 never reached the route; the second send did"
+
+
+def test_throttling_that_would_outlast_the_key_window_stops_and_asks(
+    xero, client_factory, engine_factory, make_webhook
+):
+    """``Retry-After`` is honoured -- up to the point where honouring it crosses six minutes.
+
+    Two 429s with ``Retry-After: 200`` add up to 400 seconds of waiting. A
+    send after that is "processed as a new key": if an earlier send under
+    this key did land, the resend is the duplicate. So the transport stops
+    at the window's edge and raises ``UnknownOutcome``; the sync then does
+    what it does with every unknown outcome -- it looks up first.
+    """
+    slept: list[float] = []
+    client = client_factory(xero, sleep=slept.append)
+    xero.throttle_next(2, retry_after=200)
+
+    with pytest.raises(UnknownOutcome) as exc:
+        client.create_contact(CONTACT, idempotency_key=KEY)
+
+    assert slept == [200.0], "the first wait fit; the second would have crossed the window"
+    assert str(IDEMPOTENCY_TTL_SECONDS) in str(exc.value)
+    assert xero.contacts == {}
+    throttled = [r for r in xero.request_log if r.startswith("429")]
+    assert len(throttled) == 2 and all(f"key={KEY}" in r for r in throttled)
+
+    # The same thing through the sync: it records the doubt, and the next run
+    # asks by the planted number before it sends.
+    webhook = make_webhook(deal_id="deal-429")
+    xero.throttle_next(2, retry_after=200)
+    with pytest.raises(UnknownOutcome):
+        engine_factory(xero).apply(webhook)
+    deal = engine_factory(xero).apply(webhook)
+    assert deal.sync_status == SYNC_SYNCED and len(xero.contacts) == 1
+    assert f"GET /api.xro/2.0/Contacts/{contact_number_for('deal-429')} key=-" in xero.request_log

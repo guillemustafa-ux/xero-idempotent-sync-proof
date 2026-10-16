@@ -69,6 +69,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, NamedTuple
 from urllib.parse import parse_qs, urlparse
 
+from .ledger import IDEMPOTENCY_TTL_SECONDS  # noqa: F401 -- re-exported; one definition
+
 # Credentials the fake token endpoint accepts (Basic auth on the refresh call).
 CLIENT_ID = "proof-client-id"
 CLIENT_SECRET = "proof-client-secret"
@@ -80,8 +82,8 @@ SCOPES = "offline_access accounting.contacts accounting.invoices accounting.paym
 BANK_ACCOUNT_CODE = "090"
 SALES_ACCOUNT_CODE = "200"
 
-# Documented limits and lifetimes, in seconds.
-IDEMPOTENCY_TTL_SECONDS = 6 * 60
+# Documented limits and lifetimes, in seconds (the idempotency TTL is
+# imported from the ledger so there is exactly one definition).
 IDEMPOTENCY_KEY_MAX_LEN = 128
 CONTACT_NUMBER_MAX_LEN = 50
 ACCESS_TOKEN_TTL_SECONDS = 30 * 60
@@ -156,6 +158,9 @@ class XeroState:
     armed: list[tuple[str, str]] = field(default_factory=list)
     throttle_remaining: int = 0
     retry_after: int = 3
+    # Armed 5xx answers: (status, how many), served before any route runs.
+    server_error_status: int = 503
+    server_error_remaining: int = 0
     # None -> the default wording (an assumption; the docs give none).
     number_collision_message: str | None = None
     minute_remaining: int = MINUTE_LIMIT
@@ -393,7 +398,7 @@ class _Handler(BaseHTTPRequestHandler):
 
             key = self.headers.get("Idempotency-Key")
             mutating = method in ("POST", "PUT", "PATCH")
-            if self._throttled(method, key):
+            if self._throttled(method, key) or self._server_errored(method):
                 return
             state.minute_remaining = max(0, state.minute_remaining - 1)
             state.day_remaining = max(0, state.day_remaining - 1)
@@ -499,6 +504,27 @@ class _Handler(BaseHTTPRequestHandler):
                 "X-DayLimit-Remaining": str(state.day_remaining),
             },
         )
+        return True
+
+    def _server_errored(self, method: str) -> bool:
+        """An armed 5xx: the way a gateway answers, HTML body and all, before any route runs.
+
+        Nothing is committed and nothing is cached under the key. The client
+        cannot know that: a 5xx says nothing about the write.
+        """
+        state = self.state
+        if state.server_error_remaining <= 0:
+            return False
+        state.server_error_remaining -= 1
+        status = state.server_error_status
+        path = urlparse(self.path).path
+        state.request_log.append(f"{status} {method} {path}")
+        body = f"<html><body><h1>{status}</h1></body></html>".encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
         return True
 
     def _dispatch(self, method: str, path: str, query: dict[str, list[str]], raw: bytes) -> _Reply:
@@ -942,6 +968,12 @@ class FakeXero:
         with self.state._lock:
             self.state.throttle_remaining = n
             self.state.retry_after = retry_after
+
+    def fail_next_with(self, status: int, n: int = 1) -> None:
+        """Answer the next ``n`` API calls with a bare 5xx (HTML body), committing nothing."""
+        with self.state._lock:
+            self.state.server_error_status = status
+            self.state.server_error_remaining = n
 
     def answer_number_collisions_with(self, message: str) -> None:
         """Change the (undocumented) wording of the duplicate-ContactNumber 400."""

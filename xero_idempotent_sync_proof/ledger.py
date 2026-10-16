@@ -60,6 +60,10 @@ PROJECT_MODES = (PROJECT_MODE_PROJECTS_API, PROJECT_MODE_UNAVAILABLE)
 
 # Xero caps Idempotency-Key at 128 characters; "xis-" + 40 hex = 44.
 IDEMPOTENCY_KEY_MAX_LEN = 128
+# Xero remembers an Idempotency-Key for six minutes from the first call. The
+# one place this number lives: the transport refuses to wait past it, the
+# fake forgets keys at it, the tests step the clock over it.
+IDEMPOTENCY_TTL_SECONDS = 6 * 60
 # Xero caps ContactNumber at 50 characters.
 CONTACT_NUMBER_MAX_LEN = 50
 

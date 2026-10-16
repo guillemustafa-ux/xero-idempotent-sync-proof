@@ -592,3 +592,23 @@ def test_drop_before_commit_leaves_nothing_behind(xero, token, authorised_invoic
     )
     assert status == 200 and "X-Fake-Replayed" not in headers
     assert len(xero.payments) == 1
+
+
+def test_a_server_error_is_not_a_xero_body_and_commits_nothing(xero, token):
+    """``fail_next_with``: a 5xx with an HTML body, the way a gateway answers, before any route runs."""
+    xero.fail_next_with(503)
+    req = urllib.request.Request(
+        xero.base_url + "/api.xro/2.0/Contacts", data=json.dumps(contact("Ana")).encode(), method="PUT"
+    )
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("xero-tenant-id", TENANT_ID)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Idempotency-Key", "s1")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req, timeout=5)
+    assert exc.value.code == 503
+    assert exc.value.headers.get("Content-Type", "").startswith("text/html")
+    assert xero.contacts == {} and xero.idempotency_keys == {}
+
+    status, _, _ = call(xero, "PUT", "/api.xro/2.0/Contacts", token=token, body=contact("Ana"), key="s1")
+    assert status == 200 and len(xero.contacts) == 1, "only the one armed answer fails"
