@@ -325,6 +325,57 @@ def test_the_lookup_matches_the_planted_name_exactly_and_ignores_the_contacts_ot
     assert len(xero_with_projects.projects) == 4, "nothing created"
 
 
+def test_the_projects_lookup_spells_the_documented_contactID_on_the_wire(
+    xero_with_projects, client_factory, engine_factory, make_webhook
+):
+    """The query parameter is ``contactID`` (capital ID); the body spells it ``contactId``.
+
+    The fake ignores the lowercase spelling (it is not a filter), so a client
+    that sent it would still get a correct answer *after its own filter* --
+    which is why the spelling is pinned on the wire, not on the result: every
+    list request the lookup made carried ``contactID`` and the largest page.
+    """
+    engine = engine_factory(xero_with_projects)
+    deal_id = engine.ledger.record_webhook(make_webhook())
+    engine._ensure_contact(engine.ledger.get_deal(deal_id))
+    deal = engine.ledger.get_deal(deal_id)
+
+    client_factory(xero_with_projects).find_projects(deal.xero_contact_id, project_name_for(deal))
+
+    queries = xero_with_projects.project_list_queries
+    assert len(queries) >= 1
+    for query in queries:
+        assert query.get("contactID") == [deal.xero_contact_id], f"documented spelling, got {query}"
+        assert "contactId" not in query
+        assert query.get("pageSize") == ["500"]
+
+
+def test_the_projects_lookup_filters_by_contact_itself_when_the_service_does_not(
+    xero_with_projects, client_factory, engine_factory, make_webhook
+):
+    """A service that ignores ``contactID`` hands back every project; the client must not trust the page.
+
+    A stranger's project carries our exact name. Without the client-side
+    contact filter it is "ours" -- two matches, an escalation, or worse, an
+    adoption of someone else's project.
+    """
+    engine = engine_factory(xero_with_projects)
+    deal_id = engine.ledger.record_webhook(make_webhook())
+    engine._ensure_contact(engine.ledger.get_deal(deal_id))
+    deal = engine.ledger.get_deal(deal_id)
+    name = project_name_for(deal)
+    stranger = xero_with_projects.plant_contact("Someone Else")
+    xero_with_projects.plant_project(stranger["ContactID"], name)
+    ours = xero_with_projects.plant_project(deal.xero_contact_id, name)
+    xero_with_projects.ignore_project_contact_filter()
+
+    found = client_factory(xero_with_projects).find_projects(deal.xero_contact_id, name)
+
+    assert [p["projectId"] for p in found] == [ours["projectId"]], "the stranger's project was on the page"
+    synced = engine.sync(deal_id)
+    assert synced.xero_project_id == ours["projectId"] and len(xero_with_projects.projects) == 2
+
+
 def test_a_lost_response_on_the_project_create_is_settled_by_the_name_lookup(
     xero_with_projects, engine_factory, make_webhook
 ):

@@ -224,6 +224,13 @@ class XeroState:
     server_error_remaining: int = 0
     # None -> the default wording (an assumption; the docs give none).
     number_collision_message: str | None = None
+    # When True the Projects list ignores ``contactID`` and returns every
+    # project: a service that does not honour the filter, so a client's own
+    # contact check can be shown to be load-bearing.
+    projects_ignore_contact_filter: bool = False
+    # Every query string the Projects list received, parsed, so a test can
+    # pin the documented spelling (``contactID``) on the wire.
+    project_list_queries: list[dict[str, list[str]]] = field(default_factory=list)
     minute_remaining: int = MINUTE_LIMIT
     day_remaining: int = DAY_LIMIT
 
@@ -988,7 +995,10 @@ class _Handler(BaseHTTPRequestHandler):
             # response body spells it ``contactId``), ``states``, ``page``
             # (default 1) and ``pageSize`` (1..500, default 50). Anything
             # else -- ``contactId`` included -- is not a filter.
+            state.project_list_queries.append(query)
             contact_id = (query.get("contactID") or [None])[0]
+            if state.projects_ignore_contact_filter:
+                contact_id = None
             items = state.projects_under(contact_id)
             if "states" in query:
                 wanted = set(query["states"][0].split(","))
@@ -1119,6 +1129,16 @@ class FakeXero:
         """What the authorisation granted (space-separated); the next access token's ``scope`` claim."""
         with self.state._lock:
             self.state.granted_scopes = scopes
+
+    def ignore_project_contact_filter(self) -> None:
+        """The Projects list stops honouring ``contactID`` and returns every project."""
+        with self.state._lock:
+            self.state.projects_ignore_contact_filter = True
+
+    @property
+    def project_list_queries(self) -> list[dict[str, list[str]]]:
+        """The parsed query string of every ``GET /Projects`` list request, in order."""
+        return self.state.project_list_queries
 
     def set_projects_available(self, available: bool) -> None:
         with self.state._lock:
