@@ -181,6 +181,62 @@ def contact_name_for(couple_names: list[str], wedding_date: str, variant: int = 
     return base if variant == 0 else f"{base} ({wedding_date})"
 
 
+DEALS_COLUMNS = (
+    "deal_id",
+    "couple_names",
+    "wedding_date",
+    "contract_total",
+    "xero_contact_id",
+    "xero_contact_name",
+    "xero_contact_number",
+    "xero_project_id",
+    "project_mode",
+    "xero_invoice_id",
+    "xero_invoice_number",
+    "amount_paid",
+    "amount_owed",
+    "last_payment_at",
+    "sync_status",
+    "last_error",
+)
+
+
+def _deals_table_sql(name: str) -> str:
+    """The ``deals`` DDL, under the given table name so an upgrade can rebuild it alongside the old one."""
+    return f"""
+        CREATE TABLE IF NOT EXISTS {name} (
+            deal_id              TEXT PRIMARY KEY,
+            couple_names         TEXT NOT NULL,
+            wedding_date         TEXT NOT NULL,
+            contract_total       REAL NOT NULL,
+            xero_contact_id      TEXT,
+            xero_contact_name    TEXT,
+            xero_contact_number  TEXT,
+            xero_project_id      TEXT,
+            project_mode         TEXT,
+            xero_invoice_id      TEXT,
+            xero_invoice_number  TEXT,
+            amount_paid          REAL NOT NULL DEFAULT 0,
+            amount_owed          REAL NOT NULL DEFAULT 0,
+            last_payment_at      TEXT,
+            sync_status          TEXT NOT NULL,
+            last_error           TEXT,
+            -- A project id exists exactly when the mode says a real
+            -- Project was made. Enforced here, not only in the code. A
+            -- CASE, not a chain of ORs: a NULL mode compared with '='
+            -- yields NULL, and SQLite lets a NULL CHECK pass.
+            CHECK (
+                CASE
+                    WHEN project_mode IS NULL THEN xero_project_id IS NULL
+                    WHEN project_mode = '{PROJECT_MODE_PROJECTS_API}' THEN xero_project_id IS NOT NULL
+                    WHEN project_mode = '{PROJECT_MODE_UNAVAILABLE}' THEN xero_project_id IS NULL
+                    ELSE 0
+                END
+            )
+        )
+        """
+
+
 @dataclass
 class Deal:
     deal_id: str
@@ -230,40 +286,7 @@ class Ledger:
         self._conn.execute("PRAGMA journal_mode=WAL")
         # Durability over throughput: a crash must not lose the last commit.
         self._conn.execute("PRAGMA synchronous=FULL")
-        self._conn.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS deals (
-                deal_id              TEXT PRIMARY KEY,
-                couple_names         TEXT NOT NULL,
-                wedding_date         TEXT NOT NULL,
-                contract_total       REAL NOT NULL,
-                xero_contact_id      TEXT,
-                xero_contact_name    TEXT,
-                xero_contact_number  TEXT,
-                xero_project_id      TEXT,
-                project_mode         TEXT,
-                xero_invoice_id      TEXT,
-                xero_invoice_number  TEXT,
-                amount_paid          REAL NOT NULL DEFAULT 0,
-                amount_owed          REAL NOT NULL DEFAULT 0,
-                last_payment_at      TEXT,
-                sync_status          TEXT NOT NULL,
-                last_error           TEXT,
-                -- A project id exists exactly when the mode says a real
-                -- Project was made. Enforced here, not only in the code. A
-                -- CASE, not a chain of ORs: a NULL mode compared with '='
-                -- yields NULL, and SQLite lets a NULL CHECK pass.
-                CHECK (
-                    CASE
-                        WHEN project_mode IS NULL THEN xero_project_id IS NULL
-                        WHEN project_mode = '{PROJECT_MODE_PROJECTS_API}' THEN xero_project_id IS NOT NULL
-                        WHEN project_mode = '{PROJECT_MODE_UNAVAILABLE}' THEN xero_project_id IS NULL
-                        ELSE 0
-                    END
-                )
-            )
-            """
-        )
+        self._conn.execute(_deals_table_sql("deals"))
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS payments (
@@ -291,6 +314,14 @@ class Ledger:
             )
             """
         )
+        self._create_binding_indexes()
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS payments_xero_uq "
+            "ON payments(xero_payment_id) WHERE xero_payment_id IS NOT NULL"
+        )
+        self._upgrade()
+
+    def _create_binding_indexes(self) -> None:
         # One Xero entity binds to at most one local thing. The database
         # refuses a second binding even if the code is wrong.
         for name, column in (
@@ -302,11 +333,6 @@ class Ledger:
                 f"CREATE UNIQUE INDEX IF NOT EXISTS {name} "
                 f"ON deals({column}) WHERE {column} IS NOT NULL"
             )
-        self._conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS payments_xero_uq "
-            "ON payments(xero_payment_id) WHERE xero_payment_id IS NOT NULL"
-        )
-        self._upgrade()
 
     def _upgrade(self) -> None:
         """Bring a database written by an earlier version up to this schema.
@@ -319,13 +345,44 @@ class Ledger:
         project intent that an earlier version bumped; its stored key is the
         one a replica on a fresh ledger would never derive, so the row is
         pinned back to attempt 0 and the derived key before anything is sent.
+        And a ``deals`` table from the first release lacks the CHECK tying
+        ``xero_project_id`` to ``project_mode``; SQLite cannot add a
+        constraint with ``ALTER TABLE``, so the table is rebuilt.
         """
         version = schema_version(self._conn, "ledger")
         if version < 2:
             add_column_if_missing(self._conn, "intents", "attempt", "INTEGER NOT NULL DEFAULT 0")
         if version < 3:
             self._pin_look_first_intents_to_attempt_zero()
+            self._rebuild_deals_if_the_project_check_is_missing()
         set_schema_version(self._conn, "ledger", LEDGER_SCHEMA_VERSION)
+
+    def _rebuild_deals_if_the_project_check_is_missing(self) -> None:
+        """Create the current table beside the old one, copy, drop, rename -- in one transaction.
+
+        The stored DDL says whether the CASE constraint is there. Dropping the
+        old table drops its indexes with it, so they are recreated on the new
+        one. A row that would violate the constraint aborts the whole thing
+        and leaves the file as it was: that is a human's question, not one
+        to settle by dropping the row.
+        """
+        stored = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'deals'"
+        ).fetchone()
+        if stored is None or "CASE" in (stored["sql"] or ""):
+            return
+        columns = ", ".join(DEALS_COLUMNS)
+        self._conn.execute("BEGIN")
+        try:
+            self._conn.execute(_deals_table_sql("deals_v3"))
+            self._conn.execute(f"INSERT INTO deals_v3 ({columns}) SELECT {columns} FROM deals")
+            self._conn.execute("DROP TABLE deals")
+            self._conn.execute("ALTER TABLE deals_v3 RENAME TO deals")
+            self._create_binding_indexes()
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def _pin_look_first_intents_to_attempt_zero(self) -> None:
         bumpable = sorted(BUMP_ATTEMPT_ON_REJECTION)

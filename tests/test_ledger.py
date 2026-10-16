@@ -234,6 +234,70 @@ def test_a_database_from_before_the_attempt_column_is_upgraded_on_open(db_path, 
     assert ledger_factory().get_intent("deal-old", STEP_INVOICE).attempt == 1, "a second open changes nothing"
 
 
+def test_a_deals_table_without_the_project_check_is_rebuilt_on_open(db_path, ledger_factory):
+    """SQLite cannot add a ``CHECK`` with ``ALTER TABLE``; the table has to be rebuilt.
+
+    The first release's ``deals`` table only restricted ``project_mode`` to
+    the two values; the rule tying ``xero_project_id`` to it came later. A
+    column-by-column upgrade leaves such a file without that rule, and the
+    code is then the only thing refusing ``projects_api`` with no id. Opening
+    the file must rebuild ``deals`` with the current constraint, keep every
+    row and every unique index, and stamp the version.
+    """
+    v1 = sqlite3.connect(db_path)
+    v1.executescript(
+        """
+        CREATE TABLE deals (
+            deal_id TEXT PRIMARY KEY, couple_names TEXT NOT NULL, wedding_date TEXT NOT NULL,
+            contract_total REAL NOT NULL, xero_contact_id TEXT, xero_contact_name TEXT,
+            xero_contact_number TEXT, xero_project_id TEXT,
+            project_mode TEXT CHECK (project_mode IS NULL OR project_mode IN ('projects_api', 'unavailable')),
+            xero_invoice_id TEXT, xero_invoice_number TEXT, amount_paid REAL NOT NULL DEFAULT 0,
+            amount_owed REAL NOT NULL DEFAULT 0, last_payment_at TEXT, sync_status TEXT NOT NULL,
+            last_error TEXT
+        );
+        CREATE UNIQUE INDEX deals_contact_uq ON deals(xero_contact_id) WHERE xero_contact_id IS NOT NULL;
+        CREATE UNIQUE INDEX deals_project_uq ON deals(xero_project_id) WHERE xero_project_id IS NOT NULL;
+        CREATE UNIQUE INDEX deals_invoice_uq ON deals(xero_invoice_id) WHERE xero_invoice_id IS NOT NULL;
+        CREATE TABLE payments (
+            deal_id TEXT NOT NULL, hubspot_payment_id TEXT NOT NULL, amount REAL NOT NULL,
+            paid_at TEXT NOT NULL, xero_payment_id TEXT, PRIMARY KEY (deal_id, hubspot_payment_id)
+        );
+        CREATE TABLE intents (
+            deal_id TEXT NOT NULL, step TEXT NOT NULL, ref TEXT NOT NULL DEFAULT '',
+            idempotency_key TEXT NOT NULL, mode TEXT, state TEXT NOT NULL, remote_id TEXT,
+            PRIMARY KEY (deal_id, step, ref)
+        );
+        INSERT INTO deals (deal_id, couple_names, wedding_date, contract_total, xero_contact_id,
+            xero_contact_name, xero_contact_number, project_mode, amount_paid, amount_owed, sync_status)
+            VALUES ('deal-x', '["A", "B"]', '2027-01-01', 100.0, 'c-1', 'A & B', 'hs-deal-x',
+                    'unavailable', 25.0, 75.0, 'synced');
+        INSERT INTO deals (deal_id, couple_names, wedding_date, contract_total, sync_status)
+            VALUES ('deal-y', '["C", "D"]', '2027-02-02', 200.0, 'pending');
+        """
+    )
+    v1.commit()
+    v1.close()
+
+    ledger = ledger_factory()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        ledger.bind_project("deal-x", None, PROJECT_MODE_PROJECTS_API)
+    kept = ledger.get_deal("deal-x")
+    assert kept.project_mode == PROJECT_MODE_UNAVAILABLE and kept.xero_contact_id == "c-1"
+    assert (kept.amount_paid, kept.amount_owed, kept.sync_status) == (25.0, 75.0, "synced"), "rows survived"
+    assert ledger.get_deal("deal-y").couple_names == ["C", "D"]
+    ledger.bind_project("deal-y", "p-1", PROJECT_MODE_PROJECTS_API)
+    with pytest.raises(sqlite3.IntegrityError):
+        ledger.bind_project("deal-x", "p-1", PROJECT_MODE_PROJECTS_API)  # the unique index is back too
+    indexes = {r[1] for r in ledger._conn.execute("PRAGMA index_list(deals)")}
+    assert {"deals_contact_uq", "deals_project_uq", "deals_invoice_uq"} <= indexes
+    assert ledger._conn.execute(
+        "SELECT version FROM schema_version WHERE component = 'ledger'"
+    ).fetchone()[0] == LEDGER_SCHEMA_VERSION
+    assert ledger_factory().get_deal("deal-y").xero_project_id == "p-1", "a second open changes nothing"
+
+
 def test_balance_is_stated_not_added(ledger_factory, make_webhook):
     ledger = ledger_factory()
     ledger.record_webhook(make_webhook())

@@ -185,9 +185,13 @@ unique does.
   mode says a real Project was made), so a future change that lies about a
   project or binds a second Xero entity to one local thing is rejected by
   the database rather than by a code review. A `schema_version` table
-  upgrades a database written by an earlier version on open (`ALTER TABLE
-  ... ADD COLUMN`), because `CREATE TABLE IF NOT EXISTS` does nothing to a
-  table that already exists.
+  upgrades a database written by an earlier version on open, because
+  `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists:
+  a missing column is added (`ALTER TABLE ... ADD COLUMN`); a `deals` table
+  whose stored DDL lacks the `CHECK` is rebuilt (create beside, copy, drop,
+  rename, indexes back, in one transaction), because SQLite cannot add a
+  constraint in place; and a payment or project intent that an earlier
+  version bumped is pinned back to attempt 0 and its derived key.
 * **Recovery walks every deal, whatever blew up.** One deal's escalation,
   rejection, unknown outcome -- or an exception nobody wrote a handler for
   -- is recorded on that deal's row and the walk continues; only an
@@ -340,9 +344,10 @@ anything based on it. It exists so the log can tell you what happened.)
 The remaining tests are the fake's own (27 in `tests/test_fake_xero.py`,
 over raw HTTP, pinning the verbatim error messages, the six-minute expiry,
 the cached error, the different-request `400`, the plain-text `404`, the
-JWT-shaped token, the grace period and the paging), the ledger's (12,
-including the upgrade of a version-1 file), the crash child's (2) and the
-live smoke's skip path (1).
+JWT-shaped token, the grace period and the paging), the ledger's (13,
+including the upgrade of a version-1 file: the added column and the
+rebuilt `deals` table), the crash child's (2) and the live smoke's skip
+path (1).
 
 ## Proof that the suite bites
 
