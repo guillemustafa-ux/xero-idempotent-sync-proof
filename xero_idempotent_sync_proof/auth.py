@@ -26,7 +26,6 @@ one store, so the limit is stated, not exercised.
 from __future__ import annotations
 
 import base64
-import binascii
 import http.client
 import json
 import sqlite3
@@ -80,7 +79,10 @@ def jwt_claims(token: str | None) -> dict | None:
     The access token is documented as a JWT that can be decoded. Decoding is
     not verifying: nothing here checks the signature, and nothing security-
     relevant is decided on these claims -- only which scopes the app should
-    expect to work, so a 403 can be told apart from a plan limit.
+    expect to work, so a 403 can be told apart from a plan limit. The token
+    is untrusted input, and this must never raise: whatever the decoder
+    objects to (bad base64, bad UTF-8, bad JSON, a payload nested so deep
+    that ``json.loads`` hits the recursion limit) reads as "unknown".
     """
     if not token or token.count(".") != 2:
         return None
@@ -88,7 +90,7 @@ def jwt_claims(token: str | None) -> dict | None:
     try:
         raw = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
         claims = json.loads(raw)
-    except (ValueError, binascii.Error):
+    except Exception:  # noqa: BLE001 -- see the docstring: unknown, never a crash
         return None
     return claims if isinstance(claims, dict) else None
 
@@ -227,7 +229,10 @@ class Authenticator:
 
         The response's ``refresh_token`` replaces the stored one every time.
         Xero does not merely fail to promise it is unchanged: it documents
-        that it is not.
+        that it is not. The rotated pair is saved **before** anything else is
+        done with the response -- the scopes are read from the access token
+        afterwards and written in a second save -- so a defect in that
+        reading can never cost the token that only exists in this response.
         """
         current = self.store.load()
         if current is None:
@@ -239,9 +244,11 @@ class Authenticator:
             access_expires_at=issued_at + float(payload.get("expires_in", ACCESS_TOKEN_LIFETIME)),
             refresh_token=payload["refresh_token"],
             refresh_expires_at=issued_at + REFRESH_TOKEN_LIFETIME,
-            scope=granted_scope_string(payload, payload["access_token"]),
         )
         self.store.save(tokens)
+        tokens.scope = granted_scope_string(payload, tokens.access_token)
+        if tokens.scope is not None:
+            self.store.save(tokens)
         return tokens
 
     def _post_refresh(self, refresh_token: str) -> dict:

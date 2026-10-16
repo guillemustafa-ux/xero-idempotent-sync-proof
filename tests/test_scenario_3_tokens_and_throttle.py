@@ -9,11 +9,15 @@ the retry does not carry the same ``Idempotency-Key``.
 
 from __future__ import annotations
 
+import base64
+
 import pytest
 
+from xero_idempotent_sync_proof import auth as auth_module
 from xero_idempotent_sync_proof.auth import (
     AuthLockedOut,
     TokenStore,
+    jwt_claims,
     refresh_but_keep_the_old_refresh_token,
 )
 from xero_idempotent_sync_proof.client import ThrottledPastWindow, UnknownOutcome, XeroRejected
@@ -164,6 +168,62 @@ def test_a_token_store_from_before_the_scope_column_is_upgraded_on_open(db_path,
     tokens = auth.refresh()
     assert tokens.scope is not None and "projects" in auth.granted_scopes()
     assert TokenStore(db_path).load().scope == tokens.scope, "the new column is written and read back"
+
+
+def jwt_with_payload(raw: bytes) -> str:
+    return "h." + base64.urlsafe_b64encode(raw).rstrip(b"=").decode() + ".s"
+
+
+DEEPLY_NESTED = jwt_with_payload(b"[" * 200_000 + b"]" * 200_000)
+
+
+def test_refresh_persists_the_rotated_token_before_it_reads_the_scopes(xero, auth_factory, monkeypatch):
+    """The module's one rule holds for the scopes too: save first, read the rest afterwards.
+
+    An access token whose payload is JSON nested two hundred thousand deep
+    makes ``json.loads`` raise ``RecursionError``, not ``ValueError``. The
+    refresh must still persist the rotated refresh token -- and report the
+    scopes as unknown -- because a token dropped on a parse error is the
+    thirty-minute lockout under another name. And whatever the scope reader
+    raises, the rotated token is already on disk when it does.
+    """
+    auth = auth_factory(xero)
+
+    def issues(access_token: str, refresh_token: str):
+        return lambda _rt: {
+            "access_token": access_token, "expires_in": 1800, "token_type": "Bearer",
+            "refresh_token": refresh_token,
+        }
+
+    monkeypatch.setattr(auth, "_post_refresh", issues(DEEPLY_NESTED, "rt-deep"))
+    tokens = auth.refresh()
+    assert tokens.refresh_token == "rt-deep" == TokenStore(auth.store.path).load().refresh_token
+    assert auth.granted_scopes() is None, "unknown, not empty, and no exception"
+
+    def the_reader_blows_up(_payload: dict, _token: str) -> str | None:
+        raise RuntimeError("a bug in the scope reader")
+
+    monkeypatch.setattr(auth_module, "granted_scope_string", the_reader_blows_up)
+    monkeypatch.setattr(auth, "_post_refresh", issues("opaque-" + "x" * 20, "rt-after-the-bug"))
+    with pytest.raises(RuntimeError):
+        auth.refresh()
+    assert TokenStore(auth.store.path).load().refresh_token == "rt-after-the-bug", (
+        "persisted before anything else was done with the response"
+    )
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        None, "", "opaque", "a.b", "a.b.c.d", "a..c", "a.!!!.c", "a.é.c",
+        jwt_with_payload(b"not json"), jwt_with_payload(b"\xff\xfe\xfd"), jwt_with_payload(b"null"),
+        jwt_with_payload(b"[1, 2]"), jwt_with_payload(b'"str"'), DEEPLY_NESTED,
+    ],
+    ids=lambda t: "deep" if t == DEEPLY_NESTED else repr(t)[:24],
+)
+def test_jwt_claims_is_none_for_anything_that_is_not_a_jwt_with_an_object_payload(token):
+    """Decoding an untrusted token must never raise: anything odd is "unknown", not a crash."""
+    assert jwt_claims(token) is None
 
 
 def test_an_expired_access_token_is_refreshed_on_401_and_the_call_retried(xero, client_factory):
