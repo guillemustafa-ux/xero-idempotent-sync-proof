@@ -342,6 +342,7 @@ anything based on it. It exists so the log can tell you what happened.)
 | 4n | `test_apply_is_safe_to_call_repeatedly` | -- | idempotence is a property of the operation, not of a retry budget |
 | 4o | `test_a_rebuilt_ledger_after_the_window_adopts_the_invoice_by_number_and_the_payment_by_reference` | ledger gone **and** window closed | **the strong claim, which QBO could not make**: no key replays anything, and every step still settles by its planted value; nothing is created, and the payment is never resent |
 | 4p | `test_two_replicas_with_unequal_rejection_counts_still_book_one_payment` | two replicas with their own databases hit the cached `400` -- the primary twice, the replica once; account fixed; window closed; seam race | **why the payment's key is never bumped**: with a per-ledger attempt in the key the two would send two keys and book the instalment twice (the reviewer's reproduction: PUT keys `key0, key1, key1, key2`, two payments); with one derived key the race ends in a replay, one payment, both ledgers bound to it |
+| 4q | `test_a_payment_intent_bumped_by_an_earlier_version_is_pinned_back_to_attempt_zero` | a payment intent left at `attempt 1` by a version that still bumped payments, no schema version stamped | opening the file pins it back to attempt 0 and the derived key, on disk; the send after the window carries that key -- the one every other ledger derives -- and the bumped key never reaches the wire |
 
 The remaining tests are the fake's own (27 in `tests/test_fake_xero.py`,
 over raw HTTP, pinning the verbatim error messages, the six-minute expiry,
@@ -619,7 +620,10 @@ production use. Specifically, the fake models these documented facts:
 * OAuth 2.0: `POST https://identity.xero.com/connect/token`; the response
   carries `access_token`, `expires_in`, `token_type`, `refresh_token` (and
   `id_token` with OpenID) -- no `scope` field; the access token is a JWT
-  that can be decoded; access token 30 minutes; refresh token 60 days,
+  that can be decoded, and the decoded example on the auth-flow page
+  carries the granted scopes as a **`scope` claim, an array of strings**
+  (`"scope": ["email", "profile", "openid", "accounting.invoices", ...]`),
+  which is where the sync reads them; access token 30 minutes; refresh token 60 days,
   rotating on every refresh, the previous one valid for a 30-minute grace
   period; `xero-tenant-id` on every API call, resolved from
   `GET https://api.xero.com/connections`; `offline_access` for a refresh
@@ -657,11 +661,6 @@ the demo company before relying on it:
   you're looking for cannot be found", the body Xero commonly sends -- so
   the client is shown to read the status, not the shape; anything other
   than a 404 is raised, never read as absent;
-* the access token's granted scopes are a **`scope` claim, an array of
-  strings**, in the JWT (the docs say the token is a decodable JWT and that
-  the token response has no `scope` field; the claim's name and shape
-  follow the IdentityServer convention and are not spelled out); when it
-  cannot be read, the sync treats the scopes as unknown, not as none;
 * `where=Name=="..."` is modelled **case-insensitive only**; the documented
   accent-insensitivity is not modelled;
 * a quote inside a `where` string literal is escaped as `\"` (the escape

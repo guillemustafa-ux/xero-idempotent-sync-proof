@@ -100,8 +100,10 @@ def granted_scope_string(payload: dict, access_token: str) -> str | None:
 
     Order of trust: the access token's ``scope`` claim (array or string),
     then a ``scope`` field in the token response if one is present, else
-    ``None``. Assumption, not verified against Xero: the claim is named
-    ``scope`` and is an array of strings.
+    ``None``. The claim is documented: the decoded access token on
+    https://developer.xero.com/documentation/guides/oauth2/auth-flow carries
+    ``"scope": ["email", "profile", "openid", "accounting.invoices", ...]``,
+    an array of strings. The string form is accepted for tolerance only.
     """
     claims = jwt_claims(access_token) or {}
     scope = claims.get("scope")

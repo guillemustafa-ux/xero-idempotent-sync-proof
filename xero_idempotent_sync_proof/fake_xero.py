@@ -342,12 +342,13 @@ class XeroState:
         """A JWT-shaped access token: header.payload.signature, base64url, **unsigned**.
 
         Documented: the access token is a JWT that "can be decoded to a JSON
-        object", and the token response carries no ``scope`` field. The
-        granted scopes therefore live only in the token's ``scope`` claim, as
-        an array. The signature is random bytes -- the fake looks tokens up
-        by their full text and nobody verifies them. Assumption, not verified
-        against Xero: the claim is named ``scope`` and is an array of strings
-        (the IdentityServer convention Xero's identity service follows).
+        object", the token response carries no ``scope`` field, and the
+        decoded token shown on the auth-flow page carries the granted scopes
+        as ``"scope": ["email", "profile", "openid", "accounting.invoices",
+        ...]`` -- an array of strings, which is the shape issued here
+        (https://developer.xero.com/documentation/guides/oauth2/auth-flow).
+        The signature is random bytes: the fake looks tokens up by their full
+        text and nobody verifies them.
         """
         now = self.now()
         header = {"alg": "RS256", "typ": "JWT", "kid": "proof"}
