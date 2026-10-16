@@ -95,10 +95,11 @@ def test_durable_sync_survives_a_real_kill_between_200_and_persist(
     assert len(xero.contacts) == 1
 
     # A brand new process, with nothing but the database.
-    recovered = engine_factory(xero).recover_all()
+    report = engine_factory(xero).recover_all()
 
     assert len(xero.contacts) == 1, "recovery must not create a second contact"
-    assert len(recovered) == 1
+    recovered = report.settled
+    assert len(recovered) == 1 and report.failed == []
     contact = next(iter(xero.contacts.values()))
     assert recovered[0].xero_contact_id == contact["ContactID"]
     assert recovered[0].xero_contact_number == contact["ContactNumber"] == number

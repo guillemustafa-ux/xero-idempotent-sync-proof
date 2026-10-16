@@ -99,7 +99,7 @@ def test_crash_between_create_project_and_persist_adopts_by_planted_name(
     # Recovery runs after the key has expired, so a resend would NOT be a
     # replay: only the lookup can keep this to one project.
     xero_with_projects.advance(IDEMPOTENCY_TTL_SECONDS + 1)
-    deal = engine_factory(xero_with_projects).recover_all()[0]
+    deal = engine_factory(xero_with_projects).recover_all().settled[0]
 
     assert len(xero_with_projects.projects) == 1, "adopted, not recreated"
     assert deal.xero_project_id == next(iter(xero_with_projects.projects))
@@ -126,7 +126,7 @@ def test_two_projects_with_the_same_planted_name_escalate_instead_of_guessing(
     assert len(xero_with_projects.projects) == 2
 
     with pytest.raises(UnresolvableStep) as exc:
-        engine_factory(xero_with_projects).recover_all()
+        engine_factory(xero_with_projects).sync(deal_id)
 
     assert exc.value.step == STEP_PROJECT
     assert "2 projects" in exc.value.detail
@@ -137,6 +137,48 @@ def test_two_projects_with_the_same_planted_name_escalate_instead_of_guessing(
     assert after.xero_project_id is None and after.project_mode is None
     assert len(xero_with_projects.projects) == 2, "still two -- we refused to make it three"
     assert xero_with_projects.invoices == {}, "and nothing downstream was booked against a guess"
+
+    # Startup recovery reports it instead of raising, and books nothing either.
+    report = engine_factory(xero_with_projects).recover_all()
+    assert report.settled == [] and [d.deal_id for d in report.failed] == [deal_id]
+    assert "refusing to pick one" in report.failed[0].last_error
+    assert len(xero_with_projects.projects) == 2 and xero_with_projects.invoices == {}
+
+
+def test_recovery_settles_the_deals_it_can_and_reports_the_one_it_cannot(
+    xero_with_projects, ledger_factory, engine_factory, run_child, make_webhook
+):
+    """One escalated deal must not hold every other deal hostage.
+
+    Deal A is in doubt and unresolvable (two projects carry its name). Deal B
+    was killed after its payment landed. Startup recovery walks both: A is
+    recorded with its reason and left alone; B is settled. A recovery that
+    stopped at the first exception would leave B's payment unbound forever
+    -- and a later redelivery with no intent lookup would be the duplicate.
+    """
+    first = make_webhook(deal_id="deal-a", couple_names=("Ana Perez", "Tomas Ruiz"), payment_id="pay-a")
+    second = make_webhook(deal_id="deal-b", couple_names=("Bea Soto", "Ivo Lund"), payment_id="pay-b")
+    ledger = ledger_factory()
+    ledger.record_webhook(first)
+    ledger.record_webhook(second)
+
+    run_child(xero_with_projects, "deal-a", crash_at="after_project_response")
+    deal_a = ledger_factory().get_deal("deal-a")
+    xero_with_projects.plant_project(deal_a.xero_contact_id, project_name_for(deal_a))
+    run_child(xero_with_projects, "deal-b", crash_at="after_payment_response")
+    assert len(xero_with_projects.payments) == 1
+
+    report = engine_factory(xero_with_projects).recover_all()
+
+    assert [d.deal_id for d in report.failed] == ["deal-a"]
+    assert report.failed[0].sync_status == SYNC_ERROR
+    assert "2 projects" in report.failed[0].last_error and "refusing to pick one" in report.failed[0].last_error
+    assert [d.deal_id for d in report.settled] == ["deal-b"]
+    assert report.settled[0].sync_status == SYNC_SYNCED
+    assert report.settled[0].amount_paid == 2500.0
+    assert len(xero_with_projects.payments) == 1, "B's payment adopted, not re-sent"
+    assert len(xero_with_projects.projects) == 3, "A's two left alone, B's one created"
+    assert ledger_factory().payments_for("deal-b")[0].xero_payment_id == next(iter(xero_with_projects.payments))
 
 
 def test_recovery_finds_the_planted_project_behind_hundreds_of_others(
@@ -164,7 +206,7 @@ def test_recovery_finds_the_planted_project_behind_hundreds_of_others(
     assert len(ours) == 1
 
     xero_with_projects.advance(IDEMPOTENCY_TTL_SECONDS + 1)  # no key left to replay
-    deal = engine_factory(xero_with_projects).recover_all()[0]
+    deal = engine_factory(xero_with_projects).recover_all().settled[0]
 
     assert len(xero_with_projects.projects) == 521, "adopted from page 2, not recreated"
     assert deal.xero_project_id == ours[0]["projectId"]

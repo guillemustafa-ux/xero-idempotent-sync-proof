@@ -172,7 +172,7 @@ def test_a_payment_survives_a_real_kill_between_200_and_persist(
     assert killed.payments_for(deal_id)[0].xero_payment_id is None
     assert len(xero.payments) == 1
 
-    deal = engine_factory(xero).recover_all()[0]
+    deal = engine_factory(xero).recover_all().settled[0]
 
     assert len(xero.payments) == 1, "recovery must not book the payment twice"
     assert deal.amount_paid == 2500.0 and deal.amount_owed == 10000.0
@@ -208,7 +208,7 @@ def test_two_payments_with_our_reference_escalate_instead_of_guessing(
     assert len(xero.payments) == 2
 
     with pytest.raises(UnresolvableStep) as exc:
-        engine_factory(xero).recover_all()
+        engine_factory(xero).sync(deal_id)
 
     assert exc.value.step == STEP_PAYMENT
     assert "2 payments" in exc.value.detail
@@ -220,6 +220,11 @@ def test_two_payments_with_our_reference_escalate_instead_of_guessing(
     assert after.payments_for(deal_id)[0].xero_payment_id is None, "nothing was adopted"
     assert len(xero.payments) == 2, "still two -- we refused to make it three"
     assert len(payment_puts(xero)) == 2, "one from the killed child, one planted; none from recovery"
+
+    report = engine_factory(xero).recover_all()
+    assert report.settled == [] and [d.deal_id for d in report.failed] == [deal_id]
+    assert planted["PaymentID"] in report.failed[0].last_error
+    assert len(xero.payments) == 2 and len(payment_puts(xero)) == 2, "recovery reported; it did not resend"
 
 
 def test_the_schema_refuses_a_second_binding(ledger_factory, make_webhook):

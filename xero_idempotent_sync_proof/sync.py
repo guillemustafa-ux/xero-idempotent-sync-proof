@@ -47,7 +47,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from .client import Created, ProjectsApiUnavailable, XeroClient, XeroRejected
+from .client import Created, ProjectsApiUnavailable, UnknownOutcome, XeroClient, XeroRejected
 from .ledger import (
     PROJECT_MODE_PROJECTS_API,
     PROJECT_MODE_UNAVAILABLE,
@@ -110,6 +110,18 @@ def project_name_for(deal: Deal) -> str:
 
 
 @dataclass
+class RecoveryReport:
+    """What startup recovery managed, and what it had to leave for a human.
+
+    ``failed`` deals carry ``last_error`` and keep ``sync_status = error``;
+    the next recovery tries them again, and each one is tried on its own.
+    """
+
+    settled: list[Deal] = field(default_factory=list)
+    failed: list[Deal] = field(default_factory=list)
+
+
+@dataclass
 class SyncEngine:
     ledger: Ledger
     client: XeroClient
@@ -160,11 +172,29 @@ class SyncEngine:
         except UnresolvableStep as exc:
             self.ledger.set_status(deal_id, SYNC_ERROR, str(exc))
             raise
+        except (XeroRejected, UnknownOutcome) as exc:
+            # Recorded where the business reads it, then re-raised: the
+            # caller decides whether to retry, the row says why it stopped.
+            self.ledger.set_status(deal_id, SYNC_ERROR, f"{type(exc).__name__}: {exc}")
+            raise
         return self.ledger.get_deal(deal_id)
 
-    def recover_all(self) -> list[Deal]:
-        """Settle every deal left in doubt by a previous run."""
-        return [self.sync(d.deal_id) for d in list(self.ledger.unresolved())]
+    def recover_all(self) -> RecoveryReport:
+        """Settle every deal left in doubt by a previous run -- each on its own.
+
+        One deal that has to be escalated, or whose Xero call fails, does not
+        stop the deals behind it: its reason is recorded on its row and the
+        walk continues. A recovery that aborted at the first exception would
+        leave every later deal in doubt until a human noticed.
+        """
+        report = RecoveryReport()
+        for pending in list(self.ledger.unresolved()):
+            try:
+                report.settled.append(self.sync(pending.deal_id))
+            except (UnresolvableStep, XeroRejected, UnknownOutcome) as exc:
+                log.warning("recovery left %s for a human: %s", pending.deal_id, exc)
+                report.failed.append(self.ledger.get_deal(pending.deal_id))
+        return report
 
     # -- contact ----------------------------------------------------------
 
