@@ -11,7 +11,8 @@ instalment -- with runnable evidence that:
 1. **no step is performed twice** across a real process kill, including the
    case where the outcome of the call is genuinely unknowable -- and
    including the retry that arrives **after Xero has forgotten the
-   `Idempotency-Key`**, which it does six minutes after the first call;
+   `Idempotency-Key`**, which the documentation puts at six minutes after
+   the first call (the live smoke saw it last longer; see [LIVE](#live));
 2. **two couples who share both names stay two contacts**, and a redelivered
    webhook never creates a second Payment;
 3. the sync takes the **honest path on Xero Projects** -- a separate product
@@ -84,7 +85,7 @@ planted** on the entity and can look up for as long as the entity exists.
 | any step after the six-minute window with no planted key | nothing | **Nothing can settle it.** Stop and escalate. This design has no such step, by construction. |
 
 The last row is the honest one, and the reason every entity here carries
-something derived from the deal. A key the service forgets in six minutes
+something derived from the deal. A key the service forgets within minutes
 recovers no information an hour later; a number the service enforces as
 unique does.
 
@@ -125,7 +126,7 @@ unique does.
   and adopts. For the **payment and project the key is never changed**: a
   per-ledger counter in the key would make two replicas send two keys for
   one instalment and book it twice (scenario 4p). A cached 400 pins those
-  steps for at most six minutes instead, with the reason on the deal row;
+  steps for at most the documented six minutes instead, with the reason on the deal row;
   the send after the window goes out under the same key and is processed
   as new. Attempt 0 stays exactly what a rebuilt ledger re-derives.
 * **The planted keys are derived the same way.** `ContactNumber`
@@ -588,8 +589,12 @@ Python 3.10+. No runtime dependencies; `pytest` only to run the proof.
 ## Scope, honestly
 
 The suite runs against a **local fake** that encodes the behaviours Xero
-documents, linked below. It has **not yet been run against a Xero
-organisation**, demo or otherwise, and this repo makes no claim of
+documents, linked below. One path has also run against a real Xero
+organisation: the live smoke's `GET /Organisation` guard, Contact
+find-or-create and start-of-run token refresh, on the Xero demo company on
+2026-10-18 (results under [LIVE](#live)). Everything else -- invoices, payments, projects, the
+OAuth failure cases, throttling, the unknown-outcome and crash-recovery
+paths -- has run only against the fake, and this repo makes no claim of
 production use. Specifically, the fake models these documented facts:
 
 * `Idempotency-Key` on `POST`/`PUT`/`PATCH`: any string up to 128
@@ -597,6 +602,9 @@ production use. Specifically, the fake models these documented facts:
   replayed within that window, errors cached too, replays counted against
   the rate limit, the same key with a different request -> `400`
   "Idempotency Key: ... is used with a different request", scoped per app.
+  The fake expires the key at exactly six minutes; on the live smoke Xero
+  still replayed about seven minutes in and had expired it by 35 minutes
+  (see [LIVE](#live)).
   [Idempotent requests](https://developer.xero.com/documentation/guides/idempotent-requests/idempotency/)
 * Contact `Name` unique across active contacts -> `400` "The contact name
   ... is already assigned to another contact. The contact name must be
@@ -695,31 +703,66 @@ against the Xero demo company:
 
 1. A [Xero developer account](https://developer.xero.com/documentation/development-accounts)
    (free; new apps start on the Starter plan with no payment method) and the
-   demo company that comes with it. The demo company resets 28 days after
-   creation, and the app has to be reconnected after a reset.
+   demo company that comes with it, entered from [My Xero](https://my.xero.com/)
+   ("Try the Demo Company (Global)" on this account). Open it once before
+   you authorise the app: before the run recorded below, an authorisation
+   made while it had not yet been opened connected only the trial
+   organisation the sign-up had created. The demo company resets 28 days
+   after creation, and the app has to be reconnected after a reset.
 2. An app with the scopes `offline_access accounting.contacts
    accounting.settings.read` (the demo-company check reads
    `GET /Organisation`), and a refresh token from your authorisation flow.
 3. Environment variables: `XERO_CLIENT_ID`, `XERO_CLIENT_SECRET`,
    `XERO_REFRESH_TOKEN`; optionally `XERO_TENANT_ID` (otherwise resolved
    from `GET /connections`, provided exactly one organisation is
-   connected), `XERO_BASE_URL` (default `https://api.xero.com`) and
+   connected; with a trial organisation from the sign-up connected too,
+   the script refuses and lists both `tenantId`s), `XERO_BASE_URL`
+   (default `https://api.xero.com`) and
    `XERO_IDENTITY_URL` (default `https://identity.xero.com`).
 4. `python scripts/live_smoke.py` -- it refreshes (and persists the rotated
    refresh token to `live_smoke.db`), reads `GET /Organisation` and
    **refuses to continue unless `IsDemoCompany` is true** (override with
    `--i-know-this-is-not-a-demo`), creates one contact with a derived
    `Idempotency-Key` and `ContactNumber`, sends the identical request again,
-   prints whether the two `ContactID`s match and whether the second response
-   repeats the first (`UpdatedDateUTC` included -- Xero sends no replay
-   marker, so identical responses are the only evidence), and finally reads
+   prints whether the second response carries the same `ContactID` and
+   `UpdatedDateUTC` as the first (Xero sends no replay marker, so identical
+   responses are the only evidence), and finally reads
    the contact back by `GET /Contacts/{ContactNumber}`. Without the
    variables it prints a skip line and exits 0. Read the refresh token back
    from `live_smoke.db` for the next run: the one you passed in is dead
    thirty minutes after the first refresh.
 
-A second run on the same day finds the name taken, looks the contact up by
-its planted number, and reports the `ContactID` it already has -- the
-six-minute key is gone by then, and the number is what settles it. The
-Projects step is not exercised live: whether the demo company has Projects
-is not verified, and the proof of that path is the fake's switchable gate.
+**Run on 2026-10-18 against `Demo Company (Global)`** (a free developer
+account and a Web app with the three scopes above; an excerpt, ids
+shortened):
+
+```
+organisation 'Demo Company (Global)' (tenant d361eff7-...): IsDemoCompany=True
+first send  -> ContactID=f1307fbe-... UpdatedDateUTC=/Date(1792348801357+0000)/
+second send -> ContactID=f1307fbe-... UpdatedDateUTC=/Date(1792348801357+0000)/ (same Idempotency-Key)
+Idempotency-Key replay: CONFIRMED, one contact; the second response repeats the first, UpdatedDateUTC included
+GET /Contacts/hs-deal-smoke-2026-10-18 -> ContactID=f1307fbe-... Name='xero-idempotent-sync-proof smoke 2026-10-18'
+```
+
+The script was run twice more that day, with the same derived key:
+
+* **About seven minutes** after the first send (the run started 6 minutes
+  55 seconds after the `UpdatedDateUTC` Xero stamped on the contact, by the
+  local clock), Xero still replayed the cached response (same
+  `ContactID`, same `UpdatedDateUTC`): on this run the
+  key outlived the documented six minutes. Nothing in the sync relies on the
+  key expiring at six minutes; a longer-lived key only means a retry is
+  answered from the key's cache -- the cached response, or the "used with a
+  different request" `400` -- where the fake would process it as new. The "at most six
+  minutes" that a cached `400` holds a payment or project step
+  (`sync.py`) is the documented figure, not a measured one.
+* **About 35 minutes** after, the key had expired: the create came back `400`, the
+  lookup by the planted `ContactNumber` found the same `ContactID`, and the
+  script reported it -- the number is what settles it.
+
+What ran live is the smoke script, not the sync: the client's contact
+create under a derived `Idempotency-Key`, its replay, the `400` once the
+key had expired, and the read-back by `ContactNumber`, all through the
+same client the sync uses. Invoices and payments have not run live, and neither
+has the Projects step: whether the demo company has Projects is not
+verified, and the proof of that path is the fake's switchable gate.
